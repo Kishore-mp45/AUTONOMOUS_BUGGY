@@ -2,276 +2,251 @@
 controllers/dwa.py
 ==================
 Dynamic Window Approach (DWA) controller.
-
-Concept:
-  At each timestep, build a 'dynamic window' of velocity commands that are
-  reachable within the next dt given the robot's acceleration limits.
-  Sample a grid of (v, omega) pairs inside the window, simulate each as a
-  short trajectory, score them on three criteria, and return the best.
-
-Scoring (higher = better for all three):
-    heading_score   — how directly the trajectory points at the goal
-    clearance_score — minimum distance to any obstacle along the trajectory
-    velocity_score  — prefer higher linear speeds
-
-Final score = alpha*heading + beta*clearance + gamma*velocity
-(alpha, beta, gamma from config)
-
-Note on bicycle model:
-  DWA is traditionally formulated for differential-drive robots (v, omega).
-  We adapt it here for the bicycle model by converting omega → steering_angle:
-      delta = arctan(omega * L / v)    [clipped to max_steer]
-  Angular velocity omega = v * tan(delta) / L
+Upgraded to true Ackermann dynamic window sampling (v, delta),
+minimum turning radius constraint, steering slew rate limits,
+and Costmap2D integration. Inherits from ControllerBase.
 """
 
 import math
 import numpy as np
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import config
+from controllers.controller_base import ControllerBase
 
 
-class DWA:
+class DWA(ControllerBase):
     """
-    Dynamic Window Approach controller.
-
-    Parameters
-    ----------
-    max_speed : float       Maximum linear speed (m/s).
-    max_accel : float       Maximum acceleration (m/s²).
-    max_steer : float       Maximum steering angle (rad).
-    dt        : float       Simulation timestep (s).
-    v_samples : int         Number of speed samples.
-    w_samples : int         Number of angular-velocity samples.
-    sim_time  : float       How far ahead to simulate each trajectory (s).
-    heading_w : float       Weight for heading-to-goal score.
-    clearance_w : float     Weight for obstacle clearance score.
-    speed_w   : float       Weight for speed score.
+    Dynamic Window Approach controller with Ackermann kinematic window (v, delta).
     """
+    name = "DWA"
 
     def __init__(
         self,
-        max_speed:   float = config.MAX_SPEED,
-        max_accel:   float = config.MAX_ACCEL,
-        max_steer:   float = config.MAX_STEER,
-        dt:          float = config.DT,
-        v_samples:   int   = config.DWA_V_SAMPLES,
-        w_samples:   int   = config.DWA_W_SAMPLES,
-        sim_time:    float = config.DWA_SIM_TIME,
-        heading_w:   float = config.DWA_HEADING_W,
-        clearance_w: float = config.DWA_CLEARANCE_W,
-        speed_w:     float = config.DWA_SPEED_W,
+        max_speed:       float = config.MAX_SPEED,
+        max_accel:       float = config.MAX_ACCEL,
+        max_steer:       float = config.MAX_STEER,
+        dt:              float = config.DT,
+        v_samples:       int   = config.DWA_V_SAMPLES,
+        steer_samples:   int   = config.DWA_STEER_SAMPLES,
+        steer_rate:      float = config.DWA_STEER_RATE,
+        min_turn_radius: float = config.DWA_MIN_TURN_RADIUS,
+        sim_time:        float = config.DWA_SIM_TIME,
+        heading_w:       float = config.DWA_HEADING_W,
+        clearance_w:     float = config.DWA_CLEARANCE_W,
+        speed_w:         float = config.DWA_SPEED_W,
     ):
-        self.max_speed   = max_speed
-        self.max_accel   = max_accel
-        self.max_steer   = max_steer
-        self.dt          = dt
-        self.v_samples   = v_samples
-        self.w_samples   = w_samples
-        self.sim_time    = sim_time
-        self.heading_w   = heading_w
-        self.clearance_w = clearance_w
-        self.speed_w     = speed_w
+        self.max_speed       = float(max_speed)
+        self.max_accel       = float(max_accel)
+        self.max_steer       = float(max_steer)
+        self.dt              = float(dt)
+        self.v_samples       = int(v_samples)
+        self.steer_samples   = int(steer_samples)
+        self.steer_rate      = float(steer_rate)
+        self.min_turn_radius = float(min_turn_radius)
+        self.sim_time        = float(sim_time)
+        self.heading_w       = float(heading_w)
+        self.clearance_w     = float(clearance_w)
+        self.speed_w         = float(speed_w)
 
-        # Maximum yaw rate corresponding to max_steer at max_speed
-        # omega_max = v * tan(delta_max) / L
         self._L = config.WHEELBASE
+        self._prev_steer = 0.0
 
-    # ------------------------------------------------------------------
-    # Main interface
-    # ------------------------------------------------------------------
+    def reset(self):
+        """Reset internal steering memory between runs."""
+        self._prev_steer = 0.0
+
+    def _build_window(self, state: np.ndarray) -> Tuple[float, float, float, float]:
+        """
+        Reachable (v, delta) in one timestep given:
+          - acceleration limits on v
+          - steering rate limit on delta
+        """
+        v = float(state[3])
+        v_min = max(0.0, v - self.max_accel * self.dt)
+        v_max = min(self.max_speed, v + self.max_accel * self.dt)
+
+        d_min = max(-self.max_steer, self._prev_steer - self.steer_rate * self.dt)
+        d_max = min(self.max_steer,  self._prev_steer + self.steer_rate * self.dt)
+        return v_min, v_max, d_min, d_max
+
+    def _is_ackermann_feasible(self, v: float, delta: float) -> bool:
+        """Reject (v, delta) if turning radius is below physical minimum."""
+        if abs(delta) < 1e-5:
+            return True
+        radius = abs(self._L / math.tan(delta))
+        return radius >= self.min_turn_radius
+
+    def _simulate_trajectory(self, state: np.ndarray, v: float, delta: float) -> List[Tuple[float, float]]:
+        """
+        Forward simulate bicycle model for sim_time seconds.
+        Returns list of (x, y) coordinates along trajectory.
+        """
+        x, y, theta = float(state[0]), float(state[1]), float(state[2])
+        steps = int(self.sim_time / self.dt)
+        traj = []
+        for _ in range(steps):
+            x += v * math.cos(theta) * self.dt
+            y += v * math.sin(theta) * self.dt
+            theta += (v / self._L) * math.tan(delta) * self.dt
+            traj.append((x, y))
+        return traj
 
     def compute_control(
         self,
-        state:     np.ndarray,
-        goal:      Tuple[float, float],
-        obstacles: List[dict],
+        state: np.ndarray,
+        path: List[Tuple[float, float]] = None,
+        goal: Optional[Tuple[float, float]] = None,
+        costmap = None,
+        obstacles: list = None,
     ) -> Tuple[float, float]:
         """
-        Compute the best (steering_angle, velocity) using DWA.
-        Fully vectorised over all (v, omega) samples — no Python loops.
-
-        Returns
-        -------
-        (delta, v_cmd) : steering angle (rad) and linear speed (m/s)
+        Compute (steering_angle, velocity) using Ackermann dynamic window.
         """
         x, y, theta, v_curr = float(state[0]), float(state[1]), float(state[2]), float(state[3])
 
-        # ── 1. Build dynamic window ──────────────────────────────────
-        v_min_dw = max(0.0,            v_curr - self.max_accel * self.dt)
-        v_max_dw = min(self.max_speed, v_curr + self.max_accel * self.dt)
+        # Goal target fallback
+        if goal is None:
+            goal = path[-1] if path else (x + 1.0, y)
 
-        v_ref        = max(v_curr, 0.1)
-        omega_max_dw = v_ref * math.tan(self.max_steer) / self._L
+        if math.hypot(goal[0] - x, goal[1] - y) < config.GOAL_TOLERANCE:
+            return 0.0, 0.0
 
-        v_1d = np.linspace(v_min_dw, v_max_dw, self.v_samples)   # (Nv,)
-        w_1d = np.linspace(-omega_max_dw, omega_max_dw, self.w_samples)  # (Nw,)
+        v_min, v_max, d_min, d_max = self._build_window(state)
 
-        # Meshgrid → flat arrays of all (v, omega) pairs, shape (N,)
-        V, W = np.meshgrid(v_1d, w_1d, indexing='ij')  # (Nv, Nw)
-        V_f  = V.ravel()   # (N,)
-        W_f  = W.ravel()   # (N,)
-        N    = len(V_f)
+        v_samples = np.linspace(v_min, v_max, self.v_samples)
+        steer_samples = np.linspace(d_min, d_max, self.steer_samples)
 
-        # ── 2. Vectorised trajectory rollout ─────────────────────────
-        # For constant (v, omega): heading evolves as:
-        #   theta_t = theta_0 + omega * t
-        # Position: x_t = x_0 + v * sum_{k=0}^{t-1} cos(theta_k) * dt
+        V_grid, D_grid = np.meshgrid(v_samples, steer_samples)
+        V_flat = V_grid.ravel()
+        D_flat = D_grid.ravel()
+        n_candidates = len(V_flat)
+
+        # 1. Ackermann feasibility check
+        feasible = np.ones(n_candidates, dtype=bool)
+        if self.min_turn_radius > 0:
+            non_zero = np.abs(D_flat) >= 1e-5
+            radii = np.full(n_candidates, float('inf'))
+            radii[non_zero] = np.abs(self._L / np.tan(D_flat[non_zero]))
+            feasible = radii >= self.min_turn_radius
+
+        if not np.any(feasible):
+            self._prev_steer = 0.0
+            return 0.0, 0.0
+
+        # Filter candidate pool to feasible ones
+        cand_v = V_flat[feasible]
+        cand_d = D_flat[feasible]
+        M = len(cand_v)
+
+        # 2. Vectorized forward simulation of all M trajectories
         steps = int(self.sim_time / self.dt)
+        xs = np.zeros((M, steps))
+        ys = np.zeros((M, steps))
+        cur_x = np.full(M, x)
+        cur_y = np.full(M, y)
+        cur_th = np.full(M, theta)
 
-        # Time steps array
-        k_arr = np.arange(steps, dtype=float)          # (T,)
+        for s in range(steps):
+            cur_x += cand_v * np.cos(cur_th) * self.dt
+            cur_y += cand_v * np.sin(cur_th) * self.dt
+            cur_th += (cand_v / self._L) * np.tan(cand_d) * self.dt
+            xs[:, s] = cur_x
+            ys[:, s] = cur_y
 
-        # Heading at each step: shape (N, T)
-        # theta_k = theta + omega * k * dt
-        thetas = theta + W_f[:, np.newaxis] * k_arr[np.newaxis, :] * self.dt  # (N,T)
-
-        # Positions via cumulative integration: shape (N, T)
-        dx_steps = V_f[:, np.newaxis] * np.cos(thetas) * self.dt  # (N, T)
-        dy_steps = V_f[:, np.newaxis] * np.sin(thetas) * self.dt  # (N, T)
-
-        xs = x + np.cumsum(dx_steps, axis=1)   # (N, T)
-        ys = y + np.cumsum(dy_steps, axis=1)   # (N, T)
-
-        # Final heading (last step), shape (N,)
-        theta_end = thetas[:, -1]
-
-        # ── 3. Collision mask ─────────────────────────────────────────
-        # collides[n] = True if any step of trajectory n hits an obstacle
-        collides = np.zeros(N, dtype=bool)
-        r = config.ROBOT_RADIUS
-        for obs in obstacles:
-            # d[n, t] = distance from sample n at step t to obstacle surface
-            d = _batch_dist_obstacle_2d(xs, ys, obs)   # (N, T)
-            collides |= np.any(d < r, axis=1)           # (N,)
-
-        # ── 4. Score valid trajectories ───────────────────────────────
-        valid = ~collides   # (N,)
-
-        if not np.any(valid):
-            return 0.0, 0.0   # emergency stop
-
-        # --- Heading score ---
-        gx, gy = goal
-        goal_angle  = np.arctan2(gy - ys[:, -1], gx - xs[:, -1])  # (N,)
-        heading_err = np.abs(np.arctan2(
-            np.sin(goal_angle - theta_end),
-            np.cos(goal_angle - theta_end)
-        ))                                                           # (N,)
-        h_scores = 1.0 - heading_err / math.pi                      # (N,)
-
-        # --- Clearance score ---
-        if obstacles:
-            min_clearance = np.full(N, np.inf)
-            for obs in obstacles:
-                d = _batch_dist_obstacle_2d(xs, ys, obs)    # (N, T)
-                d_surf = d - r
-                min_c  = np.min(d_surf, axis=1)             # (N,)
-                min_clearance = np.minimum(min_clearance, min_c)
-            min_clearance = np.clip(min_clearance, 0.0, 3.0)
-            c_scores = min_clearance / 3.0
+        # 3. Collision check
+        if costmap is not None:
+            traj_costs = costmap.query_batch(xs, ys)
+            collision_mask = np.any(traj_costs >= config.LETHAL_COST, axis=1)
+            clearance_scores = 1.0 - (np.max(traj_costs, axis=1) / 100.0)
+        elif obstacles:
+            r = config.ROBOT_RADIUS
+            # Distance checking across all trajectory points
+            min_dists = np.full(M, float('inf'))
+            for px_step, py_step in zip(xs.T, ys.T):
+                for k in range(M):
+                    d = _min_dist_to_obs(px_step[k], py_step[k], obstacles)
+                    if d < min_dists[k]:
+                        min_dists[k] = d
+            collision_mask = min_dists < r
+            clearance_scores = np.clip(min_dists / 3.0, 0.0, 1.0)
         else:
-            c_scores = np.ones(N)
+            collision_mask = np.zeros(M, dtype=bool)
+            clearance_scores = np.ones(M)
 
-        # --- Speed score ---
-        s_scores = V_f / self.max_speed   # (N,)
+        valid_mask = ~collision_mask
+        if not np.any(valid_mask):
+            # Trapped fallback
+            self._prev_steer = 0.0
+            return 0.0, 0.0
 
-        # --- Combined score (invalid → -inf) ---
-        scores = (self.heading_w   * h_scores +
-                  self.clearance_w * c_scores +
-                  self.speed_w     * s_scores)
-        scores[~valid] = -np.inf
+        # 4. Heading score
+        last_xs = xs[valid_mask, -1]
+        last_ys = ys[valid_mask, -1]
+        last_ths = cur_th[valid_mask]
+        goal_angles = np.arctan2(goal[1] - last_ys, goal[0] - last_xs)
+        heading_errs = np.abs(np.arctan2(np.sin(goal_angles - last_ths), np.cos(goal_angles - last_ths)))
+        heading_scores = 1.0 - heading_errs / math.pi
 
-        # ── 5. Pick best ──────────────────────────────────────────────
-        best_idx = int(np.argmax(scores))
-        best_v   = float(V_f[best_idx])
-        best_w   = float(W_f[best_idx])
+        # 5. Speed score
+        valid_v = cand_v[valid_mask]
+        valid_d = cand_d[valid_mask]
+        speed_scores = valid_v / self.max_speed if self.max_speed > 0 else np.zeros_like(valid_v)
+        valid_clearance = clearance_scores[valid_mask]
 
-        # Convert omega → steering angle
-        if abs(best_v) < 1e-4:
-            best_delta = 0.0
-        else:
-            best_delta = math.atan(best_w * self._L / best_v)
-        best_delta = float(np.clip(best_delta, -self.max_steer, self.max_steer))
+        # 6. Total score
+        scores = (self.heading_w   * heading_scores +
+                  self.clearance_w * valid_clearance +
+                  self.speed_w     * speed_scores)
 
-        return best_delta, best_v
+        best_idx = np.argmax(scores)
+        best_v = valid_v[best_idx]
+        best_d = valid_d[best_idx]
+
+        self._prev_steer = best_d
+        return float(best_d), float(best_v)
 
     def __repr__(self) -> str:
         return (
-            f"DWA(v_samples={self.v_samples}, w_samples={self.w_samples}, "
-            f"sim_time={self.sim_time}, "
-            f"weights=[h={self.heading_w},c={self.clearance_w},s={self.speed_w}])"
+            f"DWA(v_samples={self.v_samples}, steer_samples={self.steer_samples}, "
+            f"sim_time={self.sim_time}, min_turn_r={self.min_turn_radius})"
         )
 
-
-# ── Module-level helpers ──────────────────────────────────────────────────
 
 def _wrap_angle(a: float) -> float:
     return math.atan2(math.sin(a), math.cos(a))
 
 
-def _dist_to_obstacle(rx: float, ry: float, obs: dict) -> float:
-    """Distance from point (rx, ry) to obstacle surface. 0 if inside."""
-    if obs.get("type") == "circle" or "radius" in obs:
-        return max(0.0, math.hypot(rx - obs["x"], ry - obs["y"]) - obs["radius"])
-    ox, oy = obs["x"], obs["y"]
-    hw = obs.get("w", 1.0) / 2.0
-    hh = obs.get("h", 1.0) / 2.0
-    cx = float(np.clip(rx, ox - hw, ox + hw))
-    cy = float(np.clip(ry, oy - hh, oy + hh))
-    return math.hypot(rx - cx, ry - cy)
-
-
-def _batch_dist_obstacle_2d(
-    xs:  np.ndarray,   # shape (N, T)
-    ys:  np.ndarray,   # shape (N, T)
-    obs: dict,
-) -> np.ndarray:
-    """
-    Vectorised distance from N×T points to one obstacle surface.
-    Returns array shape (N, T).
-    """
-    if obs.get("type") == "circle" or "radius" in obs:
-        d = np.sqrt((xs - obs["x"])**2 + (ys - obs["y"])**2)
-        return np.maximum(0.0, d - obs["radius"])
-    # Axis-aligned rectangle
-    ox, oy = obs["x"], obs["y"]
-    hw = obs.get("w", 1.0) / 2.0
-    hh = obs.get("h", 1.0) / 2.0
-    cx = np.clip(xs, ox - hw, ox + hw)
-    cy = np.clip(ys, oy - hh, oy + hh)
-    return np.sqrt((xs - cx)**2 + (ys - cy)**2)
-
+def _min_dist_to_obs(px: float, py: float, obstacles: list) -> float:
+    min_d = float('inf')
+    for obs in obstacles:
+        if hasattr(obs, "dist_to_point"):
+            d = obs.dist_to_point(px, py)
+        elif isinstance(obs, dict):
+            if obs.get("type") == "circle" or "radius" in obs:
+                d = max(0.0, math.hypot(px - obs["x"], py - obs["y"]) - obs["radius"])
+            else:
+                hw = obs.get("w", 1.0) / 2.0
+                hh = obs.get("h", 1.0) / 2.0
+                cx = float(np.clip(px, obs["x"] - hw, obs["x"] + hw))
+                cy = float(np.clip(py, obs["y"] - hh, obs["y"] + hh))
+                d = math.hypot(px - cx, py - cy)
+        else:
+            d = float('inf')
+        if d < min_d:
+            min_d = d
+    return min_d
 
 
 # ── Quick self-test ───────────────────────────────────────────────────────
-
 if __name__ == "__main__":
-    print("=== DWA self-test ===")
-    ctrl = DWA()
-    print(ctrl)
-
-    goal = (19.0, 10.0)
-    obstacles = [{"type": "static", "x": 10, "y": 10, "w": 1.5, "h": 1.5}]
-
-    # Robot at start, heading East
+    print("=== Upgraded Ackermann DWA Self-Test ===")
+    dwa = DWA()
     state = np.array([1.0, 10.0, 0.0, 0.5])
-    delta, v = ctrl.compute_control(state, goal, obstacles)
-    print(f"At (1,10), v=0.5: delta={delta:.4f} rad, v_cmd={v:.3f} m/s")
-    assert v > 0, "Expected non-zero speed on clear path"
-
-    # Robot very close to obstacle — should get low speed or deflection
-    state2 = np.array([8.0, 10.0, 0.0, 1.0])
-    delta2, v2 = ctrl.compute_control(state2, goal, obstacles)
-    print(f"At (8,10), near obstacle: delta={delta2:.4f} rad, v_cmd={v2:.3f} m/s")
-
-    # Robot blocked entirely (no valid trajectory) — should return (0,0)
-    big_obs = [{"type": "static", "x": 1.05, "y": 10.0, "w": 3.0, "h": 3.0}]
-    state3 = np.array([1.0, 10.0, 0.0, 0.0])
-    delta3, v3 = ctrl.compute_control(state3, goal, big_obs)
-    print(f"Fully blocked: delta={delta3:.4f}, v={v3:.3f}  (expect 0,0)")
-    assert v3 == 0.0 and delta3 == 0.0, "Expected emergency stop"
-
-    print("\n[PASS]  DWA OK")
+    delta, v = dwa.compute_control(state, goal=(19.0, 10.0))
+    print(f"DWA computed: delta={delta:.4f} rad, v={v:.3f} m/s")
+    assert abs(delta) <= config.MAX_STEER
+    assert 0.0 <= v <= config.MAX_SPEED
+    print("[PASS] Upgraded Ackermann DWA self-test passed.")

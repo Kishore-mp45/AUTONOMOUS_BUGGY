@@ -1,0 +1,2 @@
+controller,scenario,completion_rate,avg_time_s,std_time_s,min_obs_dist_m,peak_accel,peak_jerk,reaction_time_s,failures
+MPPI,ec1_dead_end,1/1,18.05,,0.896,1.0,40.0,-,0

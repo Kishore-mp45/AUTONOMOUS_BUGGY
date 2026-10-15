@@ -1,0 +1,2 @@
+controller,scenario,run_id,completed,failure_reason,completion_time,path_length,min_obstacle_dist,peak_acceleration,peak_jerk,mean_speed,final_x,final_y,reaction_time_s,oscillation_count,recovery_count,gap_width_m
+MPPI,ec1_dead_end,0,1,,18.05,18.0928,0.8956,1.0,40.0,0.9998,18.5034,10.0058,,320,0,

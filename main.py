@@ -4,27 +4,32 @@ main.py
 Entry point for the Campus Buggy Local Planner Comparison experiment.
 
 Usage:
-    python main.py                     # run all combos, headless (fast)
+    python main.py                     # run all core combos, headless
     python main.py --viz               # run with live pygame visualisation
     python main.py --runs 3            # override RUNS_PER_COMBO (quick test)
     python main.py --ctrl RPP          # only run one controller
     python main.py --scenario s1       # only run matching scenarios
-    python main.py --headless          # explicit headless (same as default)
+    python main.py --headless          # explicit headless
+    python main.py --edge-cases        # run edge case scenarios alongside core scenarios
+    python main.py --edge-only         # run ONLY edge case scenarios
+    python main.py --report            # automatically run report generator after simulation
     python main.py --no-plots          # skip post-run plot generation
 
-Loop structure (as per implementation plan):
+Loop structure (as per implementation plan Phase G):
+    validate()
     for scenario in SCENARIOS:
         for controller in CONTROLLERS:
             for run_id in range(RUNS_PER_COMBO):
-                scenario.reset()
-                recorder = MetricsRecorder(...)
-                run_simulation(...)
-                all_results.append(recorder.to_dict())
-
-    df = pd.DataFrame(all_results)
-    df.to_csv('results/all_results.csv')
-
-After all runs, summary_table.csv is generated and plots are produced.
+                seed = BASE_SEED + run_id
+                scenario.reset(seed=seed)
+                controller.reset()
+                monitor.reset()
+                costmap = scenario.build_costmap()
+                ...
+                control = controller.compute_control(state, path, goal, costmap, obstacles)
+                status, msg = monitor.check(state, control, costmap)
+                ...
+                recorder.save_timestep_csv()
 """
 
 import os
@@ -32,6 +37,7 @@ import sys
 import argparse
 import time
 import math
+from typing import Dict, Any, Tuple
 
 import numpy as np
 import pandas as pd
@@ -42,14 +48,18 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 import config
+config.validate()
 
 # ── Robot ───────────────────────────────────────────────────────────────
-from robot.bicycle_model import BicycleModel, make_state
+from robot.bicycle_model import BicycleModel
 
 # ── Controllers ─────────────────────────────────────────────────────────
 from controllers.rpp  import RegulatedPurePursuit
 from controllers.dwa  import DWA
 from controllers.mppi import MPPI
+
+# ── Health Monitor ──────────────────────────────────────────────────────
+from health.monitor import HealthMonitor
 
 # ── Scenarios ───────────────────────────────────────────────────────────
 from scenarios.s1_static_box      import S1StaticBox
@@ -58,18 +68,30 @@ from scenarios.s3_narrow_gap      import S3NarrowGap
 from scenarios.s4_two_obstacles   import S4TwoObstacles
 from scenarios.s5_sudden_obstacle import S5SuddenObstacle
 
+# ── Edge Case Scenarios ─────────────────────────────────────────────────
+from scenarios.edge_cases import (
+    EC1DeadEnd,
+    EC2OscillationTrigger,
+    EC3TightTurn,
+    EC4LateBraking,
+    EC5Crowd,
+)
+
 # ── Metrics ─────────────────────────────────────────────────────────────
 from metrics.recorder import MetricsRecorder
 
 # ── Results directories ─────────────────────────────────────────────────
-_RESULTS_DIR = os.path.join(_HERE, "results")
-_RAW_DIR     = os.path.join(_RESULTS_DIR, "raw")
-_PLOTS_DIR   = os.path.join(_RESULTS_DIR, "plots")
-_ALL_CSV     = os.path.join(_RESULTS_DIR, "all_results.csv")
-_SUMMARY_CSV = os.path.join(_RESULTS_DIR, "summary_table.csv")
+_RESULTS_DIR   = os.path.join(_HERE, "results")
+_RAW_DIR       = os.path.join(_RESULTS_DIR, "raw")
+_PLOTS_DIR     = os.path.join(_RESULTS_DIR, "plots")
+_EDGE_DIR      = os.path.join(_RESULTS_DIR, "edge_case_results")
+_ALL_CSV       = os.path.join(_RESULTS_DIR, "all_results.csv")
+_SUMMARY_CSV   = os.path.join(_RESULTS_DIR, "summary_table.csv")
+_EDGE_ALL_CSV  = os.path.join(_EDGE_DIR, "all_edge_results.csv")
 
 os.makedirs(_RAW_DIR,   exist_ok=True)
 os.makedirs(_PLOTS_DIR, exist_ok=True)
+os.makedirs(_EDGE_DIR,  exist_ok=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -85,14 +107,25 @@ def build_controllers() -> dict:
     }
 
 
-def build_scenarios() -> dict:
-    """Instantiate all five scenarios."""
+def build_core_scenarios() -> dict:
+    """Instantiate the 5 core benchmark scenarios."""
     return {
         "s1_static_box":      S1StaticBox(),
         "s2_person_crossing": S2PersonCrossing(),
         "s3_narrow_gap":      S3NarrowGap(),
         "s4_two_obstacles":   S4TwoObstacles(),
         "s5_sudden_obstacle": S5SuddenObstacle(),
+    }
+
+
+def build_edge_scenarios() -> dict:
+    """Instantiate the 5 edge case scenarios."""
+    return {
+        "ec1_dead_end":         EC1DeadEnd(),
+        "ec2_oscillation":      EC2OscillationTrigger(),
+        "ec3_tight_turn":       EC3TightTurn(),
+        "ec4_late_braking":     EC4LateBraking(),
+        "ec5_crowd":            EC5Crowd(),
     }
 
 
@@ -103,8 +136,10 @@ def build_scenarios() -> dict:
 def run_simulation(
     scenario,
     controller,
-    recorder:  MetricsRecorder,
-    model:     BicycleModel,
+    recorder:   MetricsRecorder,
+    model:      BicycleModel,
+    monitor:    HealthMonitor,
+    costmap,
     viz=None,
     ctrl_name: str = "",
     scenario_name: str = "",
@@ -112,65 +147,93 @@ def run_simulation(
 ) -> MetricsRecorder:
     """
     Execute one episode: one controller on one scenario, full metrics recording.
-
-    Returns the completed MetricsRecorder.
     """
     state     = scenario.get_start_state().copy()
-    t         = 0.0
-    max_steps = int(config.TIME_LIMIT / config.DT)
+    max_steps = int(scenario.time_limit / config.DT)
 
-    # Reset MPPI warm-start for each fresh run
-    if hasattr(controller, "reset"):
-        controller.reset()
+    # Store scenario metadata on recorder if available
+    if hasattr(scenario, "gap_width"):
+        recorder.gap_width = getattr(scenario, "gap_width")
 
-    for _step in range(max_steps):
+    for step_i in range(max_steps):
+        t = step_i * config.DT
 
         # ── 1. Update scenario dynamics (moving obstacles / spawn) ──
-        if hasattr(scenario, "_spawned"):          # S5SuddenObstacle
+        if hasattr(scenario, "_spawned") or isinstance(scenario, S5SuddenObstacle):
             scenario.update(t, robot_state=state)
+            if hasattr(scenario, "spawn_timestep") and scenario.spawn_timestep is not None:
+                recorder.record_spawn_event(scenario.spawn_timestep)
         else:
             scenario.update(t)
 
         obstacles = scenario.get_obstacles()
+        # Re-stamp the costmap with current obstacle positions. On the S5 spawn
+        # frame scenario.update() already did this once; the extra call here
+        # guarantees the inflation layer is current for all other scenarios too.
+        costmap.update(obstacles)
 
-        # ── 2. Record this timestep ─────────────────────────────────
-        recorder.step(state, obstacles, t)
+        # ── 2. Unified controller execution ────────────────────────
+        path = scenario.get_path()
+        goal = scenario.goal
 
-        # ── 3. Check terminal conditions BEFORE computing control ───
+        try:
+            steer, v_cmd = controller.compute_control(
+                state=state,
+                path=path,
+                goal=goal,
+                costmap=costmap,
+                obstacles=obstacles,
+            )
+        except TypeError:
+            # Fallback for any legacy signature if present
+            steer, v_cmd = _legacy_compute_control(controller, state, goal, path, obstacles)
+        except Exception as exc:
+            print(f"    [WARN] Controller error at t={t:.2f}s: {exc}")
+            steer, v_cmd = 0.0, 0.0
+
+        control = (steer, v_cmd)
+
+        # ── 3. Health check ─────────────────────────────────────────
+        status, msg = monitor.check(state, control, costmap)
+        if status == "collision":
+            recorder.finish(success=False, t=t, reason="collision")
+            break
+        elif status == "stuck":
+            recorder.finish(success=False, t=t, reason="stuck")
+            break
+        elif status == "oscillating":
+            recorder.oscillations += 1
+
+        # ── 4. Record this timestep ─────────────────────────────────
+        recorder.step(
+            state=state,
+            obstacles=obstacles,
+            t=t,
+            control=control,
+            costmap=costmap,
+        )
+
+        # ── 5. Check termination conditions ─────────────────────────
         if recorder.failed:
             recorder.finish(success=False, t=t)
             break
 
-        if scenario.goal_reached(state):
-            recorder.finish(success=True, t=t)
+        done, success, reason = scenario.is_complete(state, t)
+        if done:
+            recorder.finish(success=success, t=t, reason=reason)
             break
 
-        if scenario.out_of_bounds(state):
-            recorder.mark_timeout(t)
-            recorder.finish(success=False, t=t)
-            break
-
-        # ── 4. Compute control ─────────────────────────────────────
-        try:
-            delta, v_cmd = _compute_control(
-                controller, state,
-                goal=scenario.goal,
-                path=scenario.get_path(),
-                obstacles=obstacles,
-            )
-        except Exception as exc:
-            print(f"    [WARN] Controller error at t={t:.2f}s: {exc}")
-            delta, v_cmd = 0.0, 0.0   # safe stop
-
-        # ── 5. Convert v_cmd -> acceleration ───────────────────────
+        # ── 6. Convert v_cmd -> acceleration and step robot ─────────
         a = _v_cmd_to_accel(v_cmd, float(state[3]))
-
-        # ── 6. Advance robot state ─────────────────────────────────
-        state = model.update(state, np.array([delta, a]))
-        t    += config.DT
+        state = model.update(state, np.array([steer, a]))
 
         # ── 7. Live visualisation (optional) ───────────────────────
         if viz is not None:
+            is_spawn_step = (
+                hasattr(scenario, "spawn_timestep") and
+                scenario.spawn_timestep is not None and
+                step_i == scenario.spawn_timestep
+            )
             keep_running = viz.render(
                 state=state,
                 obstacles=obstacles,
@@ -180,45 +243,41 @@ def run_simulation(
                 scenario_name=scenario_name,
                 run_id=run_id,
                 t=t,
+                costmap=costmap,
+                controller=controller,
+                health_status=status,
+                health_msg=msg,
+                spawn_event=is_spawn_step,
             )
             if not keep_running:
                 raise KeyboardInterrupt("Pygame window closed.")
 
     else:
         # Loop exhausted without goal/failure => timeout
-        recorder.mark_timeout(t)
-        recorder.finish(success=False, t=t)
+        t_final = max_steps * config.DT
+        recorder.mark_timeout(t_final)
+        recorder.finish(success=False, t=t_final, reason="timeout")
 
     # Safety net — ensure finish() was called
     if not recorder.completed and not recorder.failed:
-        recorder.finish(success=False, t=t)
+        recorder.finish(success=False, t=max_steps * config.DT)
+
+    # Save structured per-step CSV
+    recorder.save_timestep_csv(_RAW_DIR)
 
     return recorder
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Controller dispatch helper
-# ═══════════════════════════════════════════════════════════════════════════
-
-def _compute_control(controller, state, goal, path, obstacles):
-    """
-    Unified dispatch — each controller has a slightly different call signature.
-    All normalised here to return (steering_angle_rad, speed_setpoint_m/s).
-    """
+def _legacy_compute_control(controller, state, goal, path, obstacles):
     if isinstance(controller, RegulatedPurePursuit):
         return controller.compute_control(state, path, obstacles)
-
     elif isinstance(controller, DWA):
         return controller.compute_control(state, goal, obstacles)
-
     elif isinstance(controller, MPPI):
-        # MPPI returns (delta, acceleration).  Convert a -> v_next for uniformity.
         delta, a = controller.compute_control(state, path, obstacles)
         v_next   = float(np.clip(state[3] + a * config.DT, 0.0, config.MAX_SPEED))
         return delta, v_next
-
-    else:
-        raise TypeError(f"Unknown controller type: {type(controller)}")
+    raise TypeError(f"Unknown controller type: {type(controller)}")
 
 
 def _v_cmd_to_accel(v_cmd: float, v_curr: float) -> float:
@@ -234,11 +293,6 @@ def _v_cmd_to_accel(v_cmd: float, v_curr: float) -> float:
 def build_summary_table(df: pd.DataFrame) -> pd.DataFrame:
     """
     Aggregate raw per-run results into one row per controller x scenario.
-
-    Columns:
-        controller, scenario,
-        completion_rate, avg_time_s, std_time_s,
-        min_obs_dist_m, peak_accel, peak_jerk, failures
     """
     rows = []
     for (ctrl, scen), grp in df.groupby(["controller", "scenario"]):
@@ -246,6 +300,12 @@ def build_summary_table(df: pd.DataFrame) -> pd.DataFrame:
         n_complete = int(grp["completed"].sum())
         failures   = n_total - n_complete
         done       = grp[grp["completed"] == 1]
+
+        react_mean = None
+        if "reaction_time_s" in grp.columns:
+            valid_react = grp["reaction_time_s"].dropna()
+            if len(valid_react) > 0:
+                react_mean = round(valid_react.mean(), 3)
 
         rows.append({
             "controller":      ctrl,
@@ -256,6 +316,7 @@ def build_summary_table(df: pd.DataFrame) -> pd.DataFrame:
             "min_obs_dist_m":  round(grp["min_obstacle_dist"].min(), 3),
             "peak_accel":      round(grp["peak_acceleration"].max(),  3),
             "peak_jerk":       round(grp["peak_jerk"].max(),          3),
+            "reaction_time_s": react_mean if react_mean is not None else "-",
             "failures":        failures,
         })
 
@@ -281,35 +342,50 @@ def main():
     parser = argparse.ArgumentParser(
         description="Campus Buggy — Local Planner Comparison Experiment"
     )
-    parser.add_argument("--viz",      action="store_true",
+    parser.add_argument("--viz",        action="store_true",
                         help="Enable live pygame visualisation")
-    parser.add_argument("--headless", action="store_true",
+    parser.add_argument("--headless",   action="store_true",
                         help="Force headless mode (no pygame)")
-    parser.add_argument("--runs",     type=int, default=config.RUNS_PER_COMBO,
-                        help=f"Runs per controller x scenario combo "
-                             f"(default: {config.RUNS_PER_COMBO})")
-    parser.add_argument("--ctrl",     type=str, default=None,
+    parser.add_argument("--runs",       type=int, default=config.RUNS_PER_COMBO,
+                        help=f"Runs per controller x scenario combo (default: {config.RUNS_PER_COMBO})")
+    parser.add_argument("--ctrl",       type=str, default=None,
                         help="Only run this controller: RPP | DWA | MPPI")
-    parser.add_argument("--scenario", type=str, default=None,
+    parser.add_argument("--scenario",   type=str, default=None,
                         help="Only run scenarios whose name contains this substring")
-    parser.add_argument("--no-plots", action="store_true",
+    parser.add_argument("--edge-cases", action="store_true",
+                        help="Include the 5 edge case scenarios in the simulation runs")
+    parser.add_argument("--edge-only",  action="store_true",
+                        help="Run ONLY the 5 edge case scenarios")
+    parser.add_argument("--report",     action="store_true",
+                        help="Generate 8-plot comparison report after runs")
+    parser.add_argument("--no-plots",   action="store_true",
                         help="Skip post-run matplotlib plot generation")
     args = parser.parse_args()
 
     use_viz = args.viz and not args.headless and not config.HEADLESS
     runs    = args.runs
 
-    # ── Instantiate everything ─────────────────────────────────────
+    # ── Instantiate controllers & models ───────────────────────────
     model       = BicycleModel()
+    monitor     = HealthMonitor()
     controllers = build_controllers()
-    scenarios   = build_scenarios()
+
+    # Determine which scenarios to run
+    if args.edge_only:
+        scenarios = build_edge_scenarios()
+        is_edge_experiment = True
+    elif args.edge_cases:
+        scenarios = {**build_core_scenarios(), **build_edge_scenarios()}
+        is_edge_experiment = False
+    else:
+        scenarios = build_core_scenarios()
+        is_edge_experiment = False
 
     # Filters
     if args.ctrl:
         key = args.ctrl.upper()
         if key not in controllers:
-            print(f"[ERROR] Unknown controller '{key}'. "
-                  f"Choose from: {list(controllers)}")
+            print(f"[ERROR] Unknown controller '{key}'. Choose from: {list(controllers)}")
             sys.exit(1)
         controllers = {key: controllers[key]}
 
@@ -354,7 +430,19 @@ def main():
 
                 for run_id in range(runs):
                     run_count += 1
-                    scenario.reset()
+
+                    # Seed-based reproducibility (Phase G specification)
+                    seed = config.BASE_SEED + run_id
+                    scenario.reset(seed=seed)
+                    controller.reset()
+                    monitor.reset()
+                    model.reset()
+                    # Use the scenario's own costmap so that scenario.update()
+                    # and the controller always see the same Costmap2D object.
+                    costmap = scenario.costmap
+                    if costmap is None:
+                        costmap = scenario.build_costmap()
+                        scenario.costmap = costmap
 
                     recorder = MetricsRecorder(ctrl_name, scenario_name, run_id)
 
@@ -365,6 +453,8 @@ def main():
                         controller=controller,
                         recorder=recorder,
                         model=model,
+                        monitor=monitor,
+                        costmap=costmap,
                         viz=viz,
                         ctrl_name=ctrl_name,
                         scenario_name=scenario_name,
@@ -377,7 +467,7 @@ def main():
                     result = recorder.to_dict()
                     all_results.append(result)
 
-                    # Save per-run time-series CSV
+                    # Save per-run legacy time-series CSV as well
                     raw_csv = os.path.join(
                         _RAW_DIR,
                         f"{ctrl_name}__{scenario_name}__run{run_id:02d}.csv"
@@ -423,12 +513,15 @@ def main():
         return
 
     df = pd.DataFrame(all_results)
-    df.to_csv(_ALL_CSV, index=False)
-    print(f"\n[SAVED] {len(df)} rows  ->  {_ALL_CSV}")
+
+    target_csv = _EDGE_ALL_CSV if is_edge_experiment else _ALL_CSV
+    df.to_csv(target_csv, index=False)
+    print(f"\n[SAVED] {len(df)} rows  ->  {target_csv}")
 
     summary = build_summary_table(df)
-    summary.to_csv(_SUMMARY_CSV, index=False)
-    print(f"[SAVED] Summary      ->  {_SUMMARY_CSV}")
+    summary_path = os.path.join(_EDGE_DIR, "edge_summary_table.csv") if is_edge_experiment else _SUMMARY_CSV
+    summary.to_csv(summary_path, index=False)
+    print(f"[SAVED] Summary      ->  {summary_path}")
 
     # ── Console summary ────────────────────────────────────────────
     print(f"\n{'='*62}")
@@ -437,15 +530,15 @@ def main():
     print(summary.to_string(index=False))
     print(f"{'='*62}\n")
 
-    # ── Generate plots ─────────────────────────────────────────────
-    if not args.no_plots:
+    # ── Generate plots / reports ───────────────────────────────────
+    if (args.report or not args.no_plots) and not is_edge_experiment:
         try:
-            from visualization.plot_results import generate_all_plots
-            print("[PLOTS] Generating result plots...")
-            generate_all_plots(df, _PLOTS_DIR)
-            print(f"[PLOTS] Saved to {_PLOTS_DIR}/\n")
+            from metrics.report_generator import generate_report
+            print("[REPORT] Generating all 8 comparison plots & summary...")
+            generate_report(_ALL_CSV, _RAW_DIR, _PLOTS_DIR, _SUMMARY_CSV)
+            print(f"[REPORT] Saved to {_PLOTS_DIR}/\n")
         except Exception as exc:
-            print(f"[WARN] Plot generation failed: {exc}")
+            print(f"[WARN] Report generation failed: {exc}")
             import traceback
             traceback.print_exc()
 
@@ -459,3 +552,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

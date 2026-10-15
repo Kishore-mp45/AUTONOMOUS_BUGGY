@@ -122,15 +122,22 @@ def plot_path_comparison(raw_csv_dir: str, out_path: str):
         # Draw obstacles
         obstacles = scen.get_obstacles()
         for obs in obstacles:
-            if obs.get("type") == "circle" or "radius" in obs:
-                r = obs.get("radius", 0.4)
-                circle = patches.Circle((obs["x"], obs["y"]), r, facecolor=ACCENT_RED, edgecolor="#ff7979", alpha=0.8, zorder=3)
+            if hasattr(obs, "radius") and obs.radius is not None:
+                circle = patches.Circle((obs.x, obs.y), obs.radius, facecolor=ACCENT_RED, edgecolor="#ff7979", alpha=0.8, zorder=3)
                 ax.add_patch(circle)
-            else:
-                w = obs.get("w", 1.0)
-                h = obs.get("h", 1.0)
-                rect = patches.Rectangle((obs["x"] - w/2.0, obs["y"] - h/2.0), w, h, facecolor=ACCENT_RED, edgecolor="#ff7979", alpha=0.8, zorder=3)
+            elif hasattr(obs, "width") and hasattr(obs, "height") and obs.width is not None and obs.height is not None:
+                rect = patches.Rectangle((obs.x - obs.width/2.0, obs.y - obs.height/2.0), obs.width, obs.height, facecolor=ACCENT_RED, edgecolor="#ff7979", alpha=0.8, zorder=3)
                 ax.add_patch(rect)
+            elif isinstance(obs, dict):
+                if obs.get("type") == "circle" or "radius" in obs:
+                    r = obs.get("radius", 0.4)
+                    circle = patches.Circle((obs["x"], obs["y"]), r, facecolor=ACCENT_RED, edgecolor="#ff7979", alpha=0.8, zorder=3)
+                    ax.add_patch(circle)
+                else:
+                    w = obs.get("w", 1.0)
+                    h = obs.get("h", 1.0)
+                    rect = patches.Rectangle((obs["x"] - w/2.0, obs["y"] - h/2.0), w, h, facecolor=ACCENT_RED, edgecolor="#ff7979", alpha=0.8, zorder=3)
+                    ax.add_patch(rect)
 
         # Draw start and goal
         ax.scatter([scen.start[0]], [scen.start[1]], c="#f1c40f", marker="*", s=180, label="Start", zorder=5)
@@ -366,7 +373,7 @@ def plot_failure_heatmap(df: pd.DataFrame, out_path: str):
 
 def generate_all_plots(df: pd.DataFrame, output_dir: str):
     """
-    Generate all 5 plots and write to the output directory.
+    Generate all 8 plots and write to the output directory.
     """
     os.makedirs(output_dir, exist_ok=True)
     raw_dir = os.path.join(os.path.dirname(output_dir), "raw")
@@ -385,6 +392,24 @@ def generate_all_plots(df: pd.DataFrame, output_dir: str):
 
     print("  -> Generating Plot 5: Failure Heatmap...")
     plot_failure_heatmap(df, os.path.join(output_dir, "plot5_failure_heatmap.png"))
+
+    # Phase H2: Plots 6, 7, 8
+    try:
+        from metrics.report_generator import (
+            plot6_reaction_time,
+            plot7_path_smoothness,
+            plot8_edge_case_summary,
+        )
+        print("  -> Generating Plot 6: Reaction Time (S5)...")
+        plot6_reaction_time(df, os.path.join(output_dir, "plot6_reaction_time.png"))
+
+        print("  -> Generating Plot 7: Path Smoothness...")
+        plot7_path_smoothness(raw_dir, os.path.join(output_dir, "plot7_path_smoothness.png"))
+
+        print("  -> Generating Plot 8: Edge Case Summary...")
+        plot8_edge_case_summary(df, os.path.join(output_dir, "plot8_edge_case_summary.png"))
+    except Exception as exc:
+        print(f"  [WARN] Extended plots 6-8 generation skipped: {exc}")
 
 
 # ── Quick self-test ───────────────────────────────────────────────────────────

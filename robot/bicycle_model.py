@@ -22,6 +22,7 @@ Integration uses a simple 1st-order Euler step (dt from config).
 """
 
 import math
+from typing import Tuple, List, Optional
 import numpy as np
 
 import sys
@@ -53,11 +54,34 @@ class BicycleModel:
         max_speed: float = config.MAX_SPEED,
         max_accel: float = config.MAX_ACCEL,
         max_steer: float = config.MAX_STEER,
+        min_turn_radius: float = config.DWA_MIN_TURN_RADIUS,
     ):
-        self.L          = wheelbase
-        self.max_speed  = max_speed
-        self.max_accel  = max_accel
-        self.max_steer  = max_steer
+        self.L               = wheelbase
+        self.wheelbase       = wheelbase
+        self.max_speed       = max_speed
+        self.max_accel       = max_accel
+        self.max_steer       = max_steer
+        self.min_turn_radius = min_turn_radius
+
+        # Internal state for jerk tracking
+        self._prev_accel     = 0.0
+        self.jerk            = 0.0
+
+    def reset(self):
+        """Reset internal acceleration and jerk states between runs."""
+        self._prev_accel = 0.0
+        self.jerk        = 0.0
+
+    def _enforce_ackermann(self, v: float, delta: float) -> Tuple[float, float]:
+        """
+        Ackermann constraint: turning radius = L / tan(delta)
+        Must not go below DWA_MIN_TURN_RADIUS.
+        """
+        if abs(delta) > 1e-6:
+            radius = self.wheelbase / math.tan(abs(delta))
+            if radius < self.min_turn_radius:
+                delta = math.copysign(math.atan(self.wheelbase / self.min_turn_radius), delta)
+        return v, delta
 
     # ------------------------------------------------------------------
     # State update
@@ -89,6 +113,9 @@ class BicycleModel:
         x, y, theta, v = state
         delta, a       = control
 
+        # Enforce Ackermann minimum turning radius limit
+        _, delta = self._enforce_ackermann(v, delta)
+
         # ── Clamp controls to physical limits ─────────────────────────
         delta = float(np.clip(delta, -self.max_steer, self.max_steer))
         a     = float(np.clip(a,     -self.max_accel,  self.max_accel))
@@ -111,7 +138,17 @@ class BicycleModel:
         # ── Clamp speed (cannot reverse unless explicitly set) ─────────
         v_new = float(np.clip(v_new, 0.0, self.max_speed))
 
+        # ── Jerk tracking ─────────────────────────────────────────────
+        self.steering_angle = delta
+        current_accel    = (v_new - state[3]) / dt if dt > 0 else 0.0
+        self.jerk        = (current_accel - self._prev_accel) / dt if dt > 0 else 0.0
+        self._prev_accel = current_accel
+
         return np.array([x_new, y_new, theta_new, v_new], dtype=float)
+
+    @property
+    def current_jerk(self) -> float:
+        return self.jerk
 
     # ------------------------------------------------------------------
     # Collision footprint
@@ -120,54 +157,18 @@ class BicycleModel:
     def get_footprint(
         self,
         state: np.ndarray,
-        length: float = config.WHEELBASE * 2,
-        width:  float = config.ROBOT_RADIUS * 2,
-    ) -> np.ndarray:
+        length: float = 0.6,
+        width:  float = 0.4,
+    ) -> List[Tuple[float, float]]:
         """
         Return the four corner positions of the robot's rectangular footprint
-        in world coordinates, accounting for current heading.
-
-        The rectangle is centred on the rear axle position (state x, y) and
-        extends `length` forward along the heading and `width` sideways.
-
-        Parameters
-        ----------
-        state : np.ndarray  shape (4,)
-            Current state [x, y, theta, v].
-        length : float
-            Robot body length in metres (default: 2 × wheelbase).
-        width : float
-            Robot body width in metres (default: 2 × robot radius).
-
-        Returns
-        -------
-        np.ndarray  shape (4, 2)
-            Four corner points [[x0,y0], [x1,y1], [x2,y2], [x3,y3]]
-            in counter-clockwise order starting from front-left.
+        in world coordinates: [(x, y), ...]
         """
-        x, y, theta, _ = state
-
-        # Half-dimensions
-        half_l = length / 2.0
-        half_w = width  / 2.0
-
-        # Corners in local body frame (front-left, front-right, rear-right, rear-left)
-        local_corners = np.array([
-            [ half_l,  half_w],
-            [ half_l, -half_w],
-            [-half_l, -half_w],
-            [-half_l,  half_w],
-        ])
-
-        # Rotation matrix
-        cos_h = math.cos(theta)
-        sin_h = math.sin(theta)
-        R = np.array([[cos_h, -sin_h],
-                      [sin_h,  cos_h]])
-
-        # Transform to world frame
-        world_corners = (R @ local_corners.T).T + np.array([x, y])
-        return world_corners
+        x, y, theta = state[0], state[1], state[2]
+        L, W = length, width
+        corners_local = [(-L/2, -W/2), (L/2, -W/2), (L/2, W/2), (-L/2, W/2)]
+        c, s = math.cos(theta), math.sin(theta)
+        return [(float(x + c*cx - s*cy), float(y + s*cx + c*cy)) for cx, cy in corners_local]
 
     # ------------------------------------------------------------------
     # Utility
