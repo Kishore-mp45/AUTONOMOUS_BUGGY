@@ -1,0 +1,16 @@
+controller,scenario,completion_rate,avg_time_s,std_time_s,min_obs_dist_m,peak_accel,peak_jerk,failures
+DWA,s1_static_box,0/1,,,0.305,1.0,20.0,1
+DWA,s2_person_crossing,1/1,15.1,,1.177,1.0,20.0,0
+DWA,s3_narrow_gap,1/1,15.1,,1.5,1.0,20.0,0
+DWA,s4_two_obstacles,0/1,,,0.305,1.0,20.0,1
+DWA,s5_sudden_obstacle,0/1,,,0.305,1.0,20.0,1
+MPPI,s1_static_box,1/1,14.0,,0.906,1.0,14.161,0
+MPPI,s2_person_crossing,1/1,12.55,,1.067,1.0,12.154,0
+MPPI,s3_narrow_gap,1/1,12.55,,1.494,1.0,10.612,0
+MPPI,s4_two_obstacles,1/1,14.05,,0.906,1.0,12.104,0
+MPPI,s5_sudden_obstacle,0/1,,,0.982,1.0,18.64,1
+RPP,s1_static_box,0/1,,,0.287,1.0,20.0,1
+RPP,s2_person_crossing,0/1,,,0.286,1.0,20.0,1
+RPP,s3_narrow_gap,1/1,15.1,,1.5,1.0,20.0,0
+RPP,s4_two_obstacles,0/1,,,0.297,1.0,20.0,1
+RPP,s5_sudden_obstacle,0/1,,,0.292,1.0,20.0,1
