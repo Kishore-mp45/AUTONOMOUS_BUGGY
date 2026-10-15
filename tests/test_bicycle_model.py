@@ -60,7 +60,7 @@ def test_ackermann_constraint():
     """Steering angle violating minimum turning radius must be clamped."""
     model = BicycleModel()
     # At minimum turn radius R_min = 0.5m, max allowable delta = arctan(L / R_min)
-    max_delta = math.atan(config.WHEELBASE / config.DWA_MIN_TURN_RADIUS)
+    max_delta = math.atan(config.WHEELBASE / config.MIN_TURN_RADIUS)
     state = make_state(x=0.0, y=0.0, theta=0.0, v=1.0)
     state = model.update(state, np.array([max_delta + 0.3, 0.0]))
     assert abs(model.steering_angle) <= max_delta + 1e-5

@@ -5,7 +5,7 @@ MetricsRecorder — records all per-run data and computes final metrics.
 Upgraded with:
   - Full timestep structured log (timestep_log)
   - Reaction time computation for sudden obstacles (S5)
-  - Oscillation and recovery counters
+  - Lane-discipline, maneuver-outcome, and MPPI recovery metrics
   - Scenario gap width metadata
   - High-precision distance calculation supporting Obstacle objects and Costmap2D
 """
@@ -47,10 +47,24 @@ class MetricsRecorder:
         # ── Extended Phase F fields ───────────────────────────────────
         self.timestep_log:   List[Dict[str, Any]] = []
         self.reaction_time:  Optional[float] = None
-        self.oscillations:   int = 0
-        self.recoveries:     int = 0
         self.gap_width:      Optional[float] = None
         self.spawn_timestep: Optional[int] = None
+        self.lane_violation_count: int = 0
+        self.maneuver_success: Dict[str, bool] = {}
+        self.wrong_lane_durations: List[Tuple[float, float]] = []
+        self.recovery_count_total: int = 0
+        self.goal_adjusted: bool = False
+        self.spawn_adjustment_count: int = 0
+        self.hesitation_time_s: float = 0.0
+        self.near_miss_count: int = 0
+        self.narrow_gap_violation_count: int = 0
+        self.cross_track_errors: List[float] = []
+        self.lateral_drifts: List[float] = []
+        self.weight_fallback_count: int = 0
+        self.ackermann_clamp_count_total: int = 0
+        self._wrong_lane_start_t: Optional[float] = None
+        self._last_recovery_count: int = 0
+        self._near_miss_active = False
 
         # ── Running scalar metrics ─────────────────────────────────────
         self.min_obstacle_dist: float = float("inf")
@@ -86,6 +100,15 @@ class MetricsRecorder:
         t:         float,
         control:   Optional[Tuple[float, float]] = None,
         costmap = None,
+        lane_map = None,
+        maneuver_mode: str = "normal",
+        mppi_recovery_count: int = 0,
+        reference_path=None,
+        lane_guidance_enabled: bool = True,
+        narrow_gap_violation: bool = False,
+        weight_fallback_count: int = 0,
+        ackermann_clamp_count: int = 0,
+        estimated_state: Optional[np.ndarray] = None,
     ) -> None:
         """
         Record one simulation timestep.
@@ -106,6 +129,42 @@ class MetricsRecorder:
         self.obs_dists.append(min_d)
         if min_d < self.min_obstacle_dist:
             self.min_obstacle_dist = min_d
+        braking_distance = (abs(v) ** 2) / (2.0 * max(config.MAX_ACCEL, 1e-6))
+        near_miss_threshold = max(
+            config.ROBOT_RADIUS + 0.2,
+            braking_distance,
+        )
+        if (
+            min_d < near_miss_threshold
+            and min_d >= config.ROBOT_RADIUS
+            and abs(v) > 0.3
+        ):
+            if not self._near_miss_active:
+                self.near_miss_count += 1
+            self._near_miss_active = True
+        else:
+            self._near_miss_active = False
+        not_at_goal = (
+            bool(reference_path)
+            and math.hypot(
+                x - reference_path[-1][0],
+                y - reference_path[-1][1],
+            ) > config.GOAL_TOLERANCE
+        )
+        if abs(v) < 0.1 and min_d < 4.0 and not_at_goal:
+            self.hesitation_time_s += config.DT
+
+        if reference_path:
+            cte_state = estimated_state if estimated_state is not None else state
+            self.cross_track_errors.append(
+                _path_distance(float(cte_state[0]), float(cte_state[1]), reference_path)
+            )
+        if not lane_guidance_enabled:
+            self.lateral_drifts.append(abs(y - config.LEFT_LANE_CENTER_Y))
+        if narrow_gap_violation:
+            self.narrow_gap_violation_count += 1
+        self.weight_fallback_count = max(self.weight_fallback_count, int(weight_fallback_count))
+        self.ackermann_clamp_count_total += int(ackermann_clamp_count)
 
         # Costmap cost lookup
         cell_cost = costmap.query(x, y) if costmap is not None else 0.0
@@ -124,7 +183,21 @@ class MetricsRecorder:
             "target_speed":  round(target_v, 4),
             "costmap_cost":  round(float(cell_cost), 2),
             "min_obs_dist":  round(float(min_d), 4),
+            "cross_track_error": (
+                round(self.cross_track_errors[-1], 4) if self.cross_track_errors else ""
+            ),
+            "lateral_drift": (
+                round(self.lateral_drifts[-1], 4) if self.lateral_drifts else ""
+            ),
+            "narrow_gap_violation": int(bool(narrow_gap_violation)),
+            "near_miss": int(self._near_miss_active),
+            "weight_fallback_count": self.weight_fallback_count,
+            "ackermann_clamp_count": int(ackermann_clamp_count),
         })
+
+        if lane_map is not None:
+            self._record_lane_state(x, y, t, lane_map, maneuver_mode)
+        self._record_recovery_count(mppi_recovery_count)
 
         # Collision detection (using robot radius)
         if min_d < config.ROBOT_RADIUS and not self.failed:
@@ -144,6 +217,20 @@ class MetricsRecorder:
     def record_spawn_event(self, spawn_timestep: int):
         """Record the timestep when a sudden obstacle spawned."""
         self.spawn_timestep = int(spawn_timestep)
+
+    def record_maneuver_result(self, maneuver_type: str, success: bool) -> None:
+        """Record the latest outcome for a maneuver type in this run."""
+        if not maneuver_type:
+            raise ValueError("maneuver_type must be non-empty")
+        self.maneuver_success[maneuver_type] = bool(success)
+
+    def record_recovery_count_total(self, total: int) -> None:
+        """Record the controller's monotonic recovery-attempt total."""
+        total = int(total)
+        if total < self.recovery_count_total:
+            raise ValueError("recovery attempt total must be monotonic")
+        self.recovery_count_total = total
+        self._last_recovery_count = total
 
     def compute_reaction_time(self) -> Optional[float]:
         """
@@ -173,6 +260,7 @@ class MetricsRecorder:
         """
         self.end_time    = time.time()
         self._sim_end_t  = t if t is not None else (self.times[-1] if self.times else 0.0)
+        self._close_wrong_lane_interval(self._sim_end_t)
         self.completed   = success
 
         if reason and not self.failed:
@@ -233,9 +321,36 @@ class MetricsRecorder:
             "final_x":           round(final_x, 4),
             "final_y":           round(final_y, 4),
             "reaction_time_s":   self.reaction_time,
-            "oscillation_count": self.oscillations,
-            "recovery_count":    self.recoveries,
+            "lane_violations":   self.lane_violation_count,
+            "wrong_lane_durations": str(self.wrong_lane_durations),
+            "maneuver_success":  str(self.maneuver_success),
+            "recovery_count_total": self.recovery_count_total,
             "gap_width_m":       self.gap_width,
+            "goal_adjusted":     int(self.goal_adjusted),
+            "spawn_adjustments": self.spawn_adjustment_count,
+            "hesitation_time_s": round(self.hesitation_time_s, 4),
+            "hesitation_time": round(self.hesitation_time_s, 4),
+            "near_miss_count":   self.near_miss_count,
+            "cross_track_error_mean": (
+                round(float(np.mean(self.cross_track_errors)), 4)
+                if self.cross_track_errors else 0.0
+            ),
+            "cross_track_error_variance": (
+                round(float(np.var(self.cross_track_errors)), 6)
+                if self.cross_track_errors else 0.0
+            ),
+            "cross_track_error_var": (
+                round(float(np.var(self.cross_track_errors)), 6)
+                if self.cross_track_errors else 0.0
+            ),
+            "lateral_drift_mean": (
+                round(float(np.mean(self.lateral_drifts)), 4)
+                if self.lateral_drifts else 0.0
+            ),
+            "narrow_gap_violations": self.narrow_gap_violation_count,
+            "narrow_gap_violation": self.narrow_gap_violation_count,
+            "weight_fallback_count": self.weight_fallback_count,
+            "ackermann_clamp_count": self.ackermann_clamp_count_total,
         }
 
     def save_csv(self, path: str) -> None:
@@ -275,16 +390,49 @@ class MetricsRecorder:
                 ])
 
     def save_timestep_csv(self, out_dir: str = "results/raw") -> str:
-        """Save extended structured timestep log (Phase F)."""
+        """Save the extended log separately from the legacy metrics CSV."""
         import pandas as pd
         os.makedirs(out_dir, exist_ok=True)
-        fname = os.path.join(out_dir, f"{self.controller_name}__{self.scenario_name}__run{self.run_id:02d}.csv")
+        fname = os.path.join(
+            out_dir,
+            f"{self.controller_name}__{self.scenario_name}__run{self.run_id:02d}_timesteps.csv",
+        )
         pd.DataFrame(self.timestep_log).to_csv(fname, index=False)
         return fname
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _record_lane_state(self, x: float, y: float, t: float, lane_map, maneuver_mode: str) -> None:
+        in_wrong_lane = lane_map.wrong_lane_violation(x, y, maneuver_mode)
+        if in_wrong_lane:
+            self.lane_violation_count += 1
+            if self._wrong_lane_start_t is None:
+                self._wrong_lane_start_t = t
+        else:
+            self._close_wrong_lane_interval(t)
+
+    def _close_wrong_lane_interval(self, end_t: float) -> None:
+        if self._wrong_lane_start_t is not None:
+            self.wrong_lane_durations.append((self._wrong_lane_start_t, end_t))
+            self._wrong_lane_start_t = None
+
+    def _record_recovery_count(self, recovery_count: int) -> None:
+        recovery_count = int(recovery_count)
+        if recovery_count < 0:
+            raise ValueError("mppi_recovery_count must be non-negative")
+
+        if recovery_count >= self._last_recovery_count:
+            self.recovery_count_total += recovery_count - self._last_recovery_count
+        elif (
+            self._last_recovery_count == config.MPPI_RECOVERY_MAX_ATTEMPTS - 1
+            and recovery_count == 0
+        ):
+            # MPPI resets its consecutive counter after the terminal recovery attempt.
+            self.recovery_count_total += 1
+
+        self._last_recovery_count = recovery_count
 
     def _mark_failure(self, reason: str, t: float) -> None:
         self.failed         = True
@@ -349,6 +497,27 @@ def _compute_path_length(positions: List[tuple]) -> float:
         dy = positions[i][1] - positions[i - 1][1]
         total += math.hypot(dx, dy)
     return total
+
+
+def _path_distance(x: float, y: float, path) -> float:
+    """Return the minimum Euclidean distance to the reference polyline."""
+    if len(path) == 1:
+        return math.hypot(x - path[0][0], y - path[0][1])
+
+    best = float("inf")
+    for start, end in zip(path, path[1:]):
+        dx, dy = end[0] - start[0], end[1] - start[1]
+        length_sq = dx * dx + dy * dy
+        if length_sq <= 1e-12:
+            px, py = start
+        else:
+            fraction = max(
+                0.0,
+                min(1.0, ((x - start[0]) * dx + (y - start[1]) * dy) / length_sq),
+            )
+            px, py = start[0] + fraction * dx, start[1] + fraction * dy
+        best = min(best, math.hypot(x - px, y - py))
+    return best
 
 
 # ── Quick self-test ───────────────────────────────────────────────────────

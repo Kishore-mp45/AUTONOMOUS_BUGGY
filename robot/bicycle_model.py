@@ -54,7 +54,7 @@ class BicycleModel:
         max_speed: float = config.MAX_SPEED,
         max_accel: float = config.MAX_ACCEL,
         max_steer: float = config.MAX_STEER,
-        min_turn_radius: float = config.DWA_MIN_TURN_RADIUS,
+        min_turn_radius: float = config.MIN_TURN_RADIUS,
     ):
         self.L               = wheelbase
         self.wheelbase       = wheelbase
@@ -75,7 +75,7 @@ class BicycleModel:
     def _enforce_ackermann(self, v: float, delta: float) -> Tuple[float, float]:
         """
         Ackermann constraint: turning radius = L / tan(delta)
-        Must not go below DWA_MIN_TURN_RADIUS.
+        Must not go below MIN_TURN_RADIUS.
         """
         if abs(delta) > 1e-6:
             radius = self.wheelbase / math.tan(abs(delta))

@@ -19,6 +19,8 @@ from config import (
     INSCRIBED_COST,
     MAP_W,
     MAP_H,
+    ROAD_Y_MIN,
+    ROAD_Y_MAX,
 )
 from environment.obstacle import Obstacle
 
@@ -80,6 +82,19 @@ class Costmap2D:
     def clear_static_layer(self):
         """Clear all static obstacles."""
         self.static_layer[:] = 0.0
+        self._inflate()
+
+    # ── Lane boundaries (Indian left-hand road) ────────
+    def add_lane_boundaries(self):
+        """
+        Stamp road boundaries (y <= ROAD_Y_MIN and y >= ROAD_Y_MAX) as lethal.
+        These are static — added once at scenario setup (called from main.py).
+        The road centerline is NOT stamped here: lane discipline is a soft
+        cost handled by LaneMap / LaneCritic, not a lethal wall.
+        """
+        row_centers = np.arange(self.rows) * self.res + self.res / 2.0
+        outside_rows = (row_centers <= ROAD_Y_MIN) | (row_centers >= ROAD_Y_MAX)
+        self.static_layer[outside_rows, :] = self.lethal_cost
         self._inflate()
 
     # ── Dynamic update (called every timestep) ──────────

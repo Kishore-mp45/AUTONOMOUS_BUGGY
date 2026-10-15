@@ -1,0 +1,6 @@
+controller,scenario,completion_rate,avg_time_s,std_time_s,min_obs_dist_m,peak_accel,peak_jerk,reaction_time_s,failures
+MPPI,s1_static_box,0/10,,,0.254,0.987,12.725,-,10
+MPPI,s2_person_crossing,0/10,,,0.445,0.987,12.771,-,10
+MPPI,s3_narrow_gap,3/10,30.85,13.68,0.418,0.987,12.757,-,7
+MPPI,s4_two_obstacles,0/10,,,0.254,1.0,20.0,-,10
+MPPI,s5_sudden_obstacle,0/10,,,0.284,0.987,12.771,-,10

@@ -49,6 +49,21 @@ class ScenarioBase(ABC):
         self.time_limit:  float                      = config.TIME_LIMIT
         self.costmap:     Optional[Costmap2D]        = None
 
+        # Maneuver / lane guidance hooks (used by edge cases ec6–ec10):
+        #   get_maneuver_command() — scenario-driven maneuver override
+        #   disable_lane_cost      — ec8: buggy navigates without lane guidance
+        #   sensor_noise           — ec9: (pos_std, heading_std) injected into
+        #                             the state passed to the controller
+        self.disable_lane_cost = False
+        self.sensor_noise: Optional[Tuple[float, float]] = None
+
+    def get_maneuver_command(self, t: float, state: Optional[np.ndarray] = None) -> Optional[str]:
+        """
+        Optional scenario-driven maneuver override ("u_turn" | "reverse" | None).
+        Called by main.py each step and fed to the ManeuverStateMachine.
+        """
+        return None
+
     def reset(self, seed: Optional[int] = None) -> np.ndarray:
         """
         Restore obstacles and environment to initial state.
@@ -92,13 +107,18 @@ class ScenarioBase(ABC):
         """Return current obstacles."""
         return self.obstacles
 
-    def is_complete(self, state: np.ndarray, t: float) -> Tuple[bool, bool, str]:
+    def is_complete(
+        self,
+        state: np.ndarray,
+        t: float,
+        goal: Optional[Tuple[float, float]] = None,
+    ) -> Tuple[bool, bool, str]:
         """
         Unified termination check.
         Returns (done: bool, success: bool, reason: str).
         """
         x, y = float(state[0]), float(state[1])
-        gx, gy = self.goal
+        gx, gy = goal if goal is not None else self.goal
         if math.hypot(x - gx, y - gy) < config.GOAL_TOLERANCE:
             return True, True, ""
         if t >= self.time_limit:
@@ -106,6 +126,39 @@ class ScenarioBase(ABC):
         if self.out_of_bounds(state):
             return True, False, "out_of_bounds"
         return False, False, ""
+
+    def clear_spawn_overlaps(self, state: np.ndarray, previously_active: set) -> List[str]:
+        """Move newly activated obstacles clear of the vehicle before planning."""
+        x, y, heading = float(state[0]), float(state[1]), float(state[2])
+        adjusted = []
+        for obstacle in self.obstacles:
+            if id(obstacle) in previously_active or not obstacle.active:
+                continue
+            if obstacle.dist_to_point(x, y) >= config.ROBOT_RADIUS:
+                continue
+
+            dx, dy = obstacle.x - x, obstacle.y - y
+            distance = math.hypot(dx, dy)
+            if distance < 1e-9:
+                dx, dy = math.cos(heading), math.sin(heading)
+                distance = 1.0
+            direction_x, direction_y = dx / distance, dy / distance
+            if obstacle.radius is not None:
+                extent = obstacle.radius
+            elif obstacle.width is not None and obstacle.height is not None:
+                extent = math.hypot(obstacle.width / 2.0, obstacle.height / 2.0)
+            else:
+                extent = 0.0
+
+            offset = extent + config.ROBOT_RADIUS + 0.5
+            obstacle.x = x + direction_x * offset
+            obstacle.y = y + direction_y * offset
+            adjusted.append(obstacle.label or "unnamed obstacle")
+            print(
+                f"[WARN] Spawn overlap for {adjusted[-1]}; moved it "
+                f"{offset:.2f} m clear of the vehicle."
+            )
+        return adjusted
 
     def goal_reached(self, state: np.ndarray) -> bool:
         """True when robot is within GOAL_TOLERANCE of goal."""

@@ -1,3 +1,15 @@
-controller,scenario,run_id,completed,failure_reason,completion_time,path_length,min_obstacle_dist,peak_acceleration,peak_jerk,mean_speed,final_x,final_y,reaction_time_s,oscillation_count,recovery_count,gap_width_m
-RPP,s1_static_box,0,0,collision,6.1,7.9875,0.2625,1.0,20.0,1.311,8.9875,10.0,,0,0,
-DWA,s1_static_box,0,0,stuck,17.25,7.7931,0.4569,1.0,30.5875,0.4518,8.7931,10.0,,0,0,
+controller,scenario,run_id,completed,failure_reason,completion_time,path_length,min_obstacle_dist,peak_acceleration,peak_jerk,mean_speed,final_x,final_y,reaction_time_s,lane_violations,wrong_lane_durations,maneuver_success,recovery_count_total,gap_width_m,goal_adjusted,spawn_adjustments,hesitation_time_s,hesitation_time,near_miss_count,cross_track_error_mean,cross_track_error_variance,cross_track_error_var,lateral_drift_mean,narrow_gap_violations,narrow_gap_violation,weight_fallback_count,ackermann_clamp_count
+MPPI,s1_static_box,0,1,,14.4,18.9202,0.5593,0.9853,13.3813,1.3106,18.5223,9.9203,,0,[],{'right_turn': False},0,,0,0,0.0,0.0,1,0.3774,0.24836,0.24836,0.0,0,0,0,0
+MPPI,s2_person_crossing,0,1,,13.9,17.5645,0.8991,0.9853,13.3705,1.2609,18.5426,9.8454,,0,[],{},0,,0,0,0.0,0.0,1,0.0977,0.001356,0.001356,0.0,0,0,0,0
+MPPI,s3_narrow_gap,0,1,,13.9,17.5618,1.4267,0.9853,13.3715,1.2607,18.5375,9.8461,,0,[],{},0,3.0,0,0,0.0,0.0,0,0.0986,0.001482,0.001482,0.0,0,0,0,0
+MPPI,s4_two_obstacles,0,1,,13.8,19.1494,0.6793,0.9853,13.4637,1.388,18.9432,9.5441,,0,[],{'right_turn': False},0,,0,0,0.0,0.0,1,0.4478,0.24914,0.24914,0.0,0,0,0,0
+MPPI,s5_sudden_obstacle,0,1,,13.85,19.2245,0.5382,0.9853,13.3705,1.3885,18.9189,9.5271,,0,[],"{'overtake': True, 'right_turn': False}",0,,0,0,0.0,0.0,1,0.3069,0.148358,0.148358,0.0,0,0,0,0
+MPPI,ec1_dead_end,0,1,,18.3,20.3122,0.6095,0.9853,13.3705,1.1077,18.5073,10.0664,,0,[],{'right_turn': False},0,,0,0,0.0,0.0,3,0.4166,0.284176,0.284176,0.0,0,0,0,0
+MPPI,ec3_tight_turn,0,0,goal_unreachable,0.0,0.0,999.0,0.0,0.0,0.0,,,,0,[],{},0,,0,0,0.0,0.0,0,0.0,0.0,0.0,0.0,0,0,0,0
+MPPI,ec4_late_braking,0,1,,13.4,18.5377,0.5755,0.9749,5.8056,1.3838,18.6804,9.6609,,0,[],{'right_turn': False},0,,0,0,0.0,0.0,1,0.3089,0.167516,0.167516,0.0,0,0,0,0
+MPPI,ec5_crowd,0,1,,13.9,17.5513,1.3495,0.9853,13.3705,1.2599,18.5295,9.8439,,0,[],{},0,,0,0,0.0,0.0,0,0.1058,0.001447,0.001447,0.0,0,0,0,0
+MPPI,ec6_wrong_lane_entry,0,0,stuck,11.3,6.8918,1.3629,0.9883,9.3241,0.6072,7.8871,8.5223,,0,[],{'overtake': False},0,,0,0,5.05,5.05,0,0.0173,7.2e-05,7.2e-05,0.0,0,0,0,0
+MPPI,ec7_u_turn_blocked,0,0,stuck,45.25,45.267,1.1337,0.9913,14.791,0.9993,2.0387,8.5731,,0,[],"{'u_turn': True, 'right_turn': False}",0,,0,0,2.1,2.1,0,0.212,0.104249,0.104249,0.0,0,0,0,0
+MPPI,ec8_missing_lane_mark,0,1,,14.4,17.788,0.8235,0.9854,9.6476,1.2321,18.5085,8.4941,,0,[],{},0,,0,0,0.0,0.0,1,0.1037,0.038102,0.038102,0.1037,0,0,0,0
+MPPI,ec9_sensor_noise,0,0,stuck,11.5,7.217,1.0589,0.9923,17.1251,0.6248,8.1911,8.5736,,0,[],{'overtake': True},0,,0,0,5.0,5.0,0,0.0593,0.001745,0.001745,0.0,0,0,0,0
+MPPI,ec10_all_samples_collide,0,0,stuck,13.95,5.9764,1.0379,0.9853,10.2331,0.4269,6.9594,9.9964,,0,[],{'overtake': False},0,,0,0,5.0,5.0,0,0.0429,0.002789,0.002789,0.0,0,0,0,0

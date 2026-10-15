@@ -1,7 +1,7 @@
 """
 controllers/controller_base.py
 ==============================
-Common interface for RPP, DWA, and MPPI local planners.
+Common interface for the MPPI local planner.
 All controllers implement compute_control() and reset().
 """
 
@@ -11,7 +11,7 @@ import numpy as np
 
 class ControllerBase:
     """
-    Common interface for RPP, DWA, MPPI.
+    Common interface for MPPI.
     All controllers must implement compute_control().
     """
     name = "Base"

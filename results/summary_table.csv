@@ -1,3 +1,15 @@
 controller,scenario,completion_rate,avg_time_s,std_time_s,min_obs_dist_m,peak_accel,peak_jerk,reaction_time_s,failures
-DWA,s1_static_box,0/1,,,0.457,1.0,30.588,-,1
-RPP,s1_static_box,0/1,,,0.262,1.0,20.0,-,1
+MPPI,ec10_all_samples_collide,0/1,,,1.038,0.985,10.233,-,1
+MPPI,ec1_dead_end,1/1,18.3,,0.61,0.985,13.37,-,0
+MPPI,ec3_tight_turn,0/1,,,999.0,0.0,0.0,-,1
+MPPI,ec4_late_braking,1/1,13.4,,0.576,0.975,5.806,-,0
+MPPI,ec5_crowd,1/1,13.9,,1.35,0.985,13.37,-,0
+MPPI,ec6_wrong_lane_entry,0/1,,,1.363,0.988,9.324,-,1
+MPPI,ec7_u_turn_blocked,0/1,,,1.134,0.991,14.791,-,1
+MPPI,ec8_missing_lane_mark,1/1,14.4,,0.824,0.985,9.648,-,0
+MPPI,ec9_sensor_noise,0/1,,,1.059,0.992,17.125,-,1
+MPPI,s1_static_box,1/1,14.4,,0.559,0.985,13.381,-,0
+MPPI,s2_person_crossing,1/1,13.9,,0.899,0.985,13.37,-,0
+MPPI,s3_narrow_gap,1/1,13.9,,1.427,0.985,13.372,-,0
+MPPI,s4_two_obstacles,1/1,13.8,,0.679,0.985,13.464,-,0
+MPPI,s5_sudden_obstacle,1/1,13.85,,0.538,0.985,13.37,-,0

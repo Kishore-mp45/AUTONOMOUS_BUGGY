@@ -53,6 +53,9 @@ COLOR_HUD_BORDER  = (60, 75, 100)
 COLOR_TEXT_MAIN   = (240, 245, 250)
 COLOR_TEXT_MUTED  = (140, 155, 175)
 COLOR_TEXT_ACCENT = (0, 210, 255)
+COLOR_ROAD_EDGE   = (235, 77, 75)
+COLOR_CENTERLINE  = (240, 200, 70)
+COLOR_LANE_TARGET = (46, 213, 115)
 
 
 class PygameViz:
@@ -97,6 +100,7 @@ class PygameViz:
 
         # Phase H: Costmap overlay toggle state & flash timer
         self.show_costmap: bool = False
+        self.show_mppi_samples: bool = False
         self.flash_timer: float = 0.0
 
     def world_to_screen(self, x: float, y: float) -> Tuple[int, int]:
@@ -127,6 +131,9 @@ class PygameViz:
         health_status: str = "ok",
         health_msg: str = "",
         spawn_event: bool = False,
+        maneuver_mode: str = "normal",
+        recovery_count: int = 0,
+        lane_violations: int = 0,
     ) -> bool:
         """
         Render a single frame.
@@ -142,7 +149,7 @@ class PygameViz:
         goal : (x, y), optional
             Goal location
         ctrl_name : str
-            Active controller identifier (RPP, DWA, MPPI)
+            Active controller identifier (MPPI)
         scenario_name : str
             Active scenario identifier
         run_id : int
@@ -157,6 +164,12 @@ class PygameViz:
             Current health status ("ok", "stuck", "oscillating", "collision")
         spawn_event : bool
             Trigger red screen flash marker when sudden obstacle spawns
+        maneuver_mode : str
+            Current MPPI maneuver mode shown in the HUD
+        recovery_count : int
+            Current consecutive MPPI recovery count shown in the HUD
+        lane_violations : int
+            Lane violation count shown in the HUD
         """
         # Handle Pygame window events
         for event in pygame.event.get():
@@ -196,6 +209,7 @@ class PygameViz:
             self._draw_costmap_overlay(costmap)
 
         self._draw_grid()
+        self._draw_lane_overlay()
 
         # ── 2. Draw Global Path ───────────────────────────────────────
         if path and len(path) >= 2:
@@ -210,7 +224,7 @@ class PygameViz:
             pygame.draw.lines(self.screen, COLOR_TRAIL, False, trail_pts, 2)
 
         # ── 3b. Draw MPPI Sample Trajectories ────────────────────────
-        if ctrl_name.upper() == "MPPI" and controller is not None:
+        if self.show_mppi_samples and ctrl_name.upper() == "MPPI" and controller is not None:
             self._draw_mppi_trajectories(state, controller)
 
         # ── 4. Draw Goal ──────────────────────────────────────────────
@@ -242,7 +256,10 @@ class PygameViz:
             self.flash_timer = max(0.0, self.flash_timer - config.DT)
 
         # ── 8. Draw HUD Overlay with Health Monitor ───────────────────
-        self._draw_hud(ctrl_name, scenario_name, run_id, t, rx, ry, rv, goal, obstacles, health_status, health_msg)
+        self._draw_hud(
+            ctrl_name, scenario_name, run_id, t, rx, ry, rv, goal, obstacles,
+            health_status, health_msg, maneuver_mode, recovery_count, lane_violations,
+        )
 
         # Display update
         pygame.display.flip()
@@ -279,8 +296,47 @@ class PygameViz:
 
         self.screen.blit(overlay_surf, (0, 0))
 
+    def _draw_lane_overlay(self):
+        """Draw the road edges, centerline, and default left-lane target."""
+        for y in (config.ROAD_Y_MIN, config.ROAD_Y_MAX):
+            pygame.draw.line(
+                self.screen, COLOR_ROAD_EDGE,
+                self.world_to_screen(0.0, y),
+                self.world_to_screen(self.map_w, y),
+                3,
+            )
+
+        for x in range(0, int(self.map_w), 2):
+            pygame.draw.line(
+                self.screen, COLOR_CENTERLINE,
+                self.world_to_screen(float(x), config.ROAD_CENTERLINE_Y),
+                self.world_to_screen(min(float(x + 1), self.map_w), config.ROAD_CENTERLINE_Y),
+                2,
+            )
+            pygame.draw.line(
+                self.screen, COLOR_LANE_TARGET,
+                self.world_to_screen(float(x), config.LEFT_LANE_CENTER_Y),
+                self.world_to_screen(min(float(x + 1), self.map_w), config.LEFT_LANE_CENTER_Y),
+                1,
+            )
+
     def _draw_mppi_trajectories(self, state: np.ndarray, controller):
-        """Draw nominal / candidate rollouts for MPPI."""
+        """Draw top weighted MPPI rollouts and the nominal sequence when available."""
+        sample_trajs = getattr(controller, "last_trajectories", None)
+        weights = getattr(controller, "last_weights", None)
+        if sample_trajs is not None and weights is not None and len(weights):
+            top_idx = np.argsort(weights)[-20:]
+            max_weight = float(np.max(weights[top_idx]))
+            if max_weight > 0:
+                for k in top_idx:
+                    intensity = max(35, int(210 * float(weights[k]) / max_weight))
+                    points = [
+                        self.world_to_screen(float(point[0]), float(point[1]))
+                        for point in sample_trajs[k]
+                    ]
+                    if len(points) >= 2:
+                        pygame.draw.lines(self.screen, (0, intensity, intensity), False, points, 1)
+
         if hasattr(controller, "U"):
             # Forward simulate nominal sequence
             U = controller.U
@@ -395,14 +451,17 @@ class PygameViz:
         pygame.draw.polygon(self.screen, COLOR_BUGGY, poly_screen)
         pygame.draw.polygon(self.screen, (255, 255, 255), poly_screen, 2)
 
-        # Front headlight / heading beam
-        front_mid_wx = rx + front_x * cos_t
-        front_mid_wy = ry + front_x * sin_t
-        fx_px, fy_px = self.world_to_screen(front_mid_wx, front_mid_wy)
-        tip_wx = rx + (front_x + 0.3) * cos_t
-        tip_wy = ry + (front_x + 0.3) * sin_t
-        tx_px, ty_px = self.world_to_screen(tip_wx, tip_wy)
-        pygame.draw.line(self.screen, COLOR_BUGGY_FRONT, (fx_px, fy_px), (tx_px, ty_px), 3)
+        # Compact paired headlights mark the front without extending the chassis.
+        for lateral_offset in (-half_w * 0.65, half_w * 0.65):
+            headlight_wx = rx + (front_x - 0.06) * cos_t - lateral_offset * sin_t
+            headlight_wy = ry + (front_x - 0.06) * sin_t + lateral_offset * cos_t
+            headlight_px = self.world_to_screen(headlight_wx, headlight_wy)
+            pygame.draw.circle(
+                self.screen,
+                COLOR_BUGGY_FRONT,
+                headlight_px,
+                max(2, self.scale_dist(0.025)),
+            )
 
         # Collision circle (safety radius outline)
         cx_px, cy_px = self.world_to_screen(rx, ry)
@@ -425,9 +484,12 @@ class PygameViz:
         obstacles: list,
         health_status: str,
         health_msg: str,
+        maneuver_mode: str,
+        recovery_count: int,
+        lane_violations: int,
     ):
         """Draw semi-transparent HUD dashboard with health status."""
-        hud_w, hud_h = 340, 180
+        hud_w, hud_h = 360, 220
         hud_surf = pygame.Surface((hud_w, hud_h), pygame.SRCALPHA)
         pygame.draw.rect(hud_surf, COLOR_HUD_BG, (0, 0, hud_w, hud_h), border_radius=8)
         pygame.draw.rect(hud_surf, COLOR_HUD_BORDER, (0, 0, hud_w, hud_h), width=1, border_radius=8)
@@ -456,7 +518,7 @@ class PygameViz:
                 min_obs = d
 
         # Header: Controller & Scenario
-        title_txt = self.font_title.render(f"{ctrl_name.upper()}", True, COLOR_TEXT_ACCENT)
+        title_txt = self.font_title.render("MPPI", True, COLOR_TEXT_ACCENT)
         run_txt   = self.font_body.render(f"Run #{run_id + 1} | {scenario_name}", True, COLOR_TEXT_MAIN)
         hud_surf.blit(title_txt, (14, 10))
         hud_surf.blit(run_txt, (14, 34))
@@ -471,6 +533,8 @@ class PygameViz:
             f"Pose: ({rx:4.1f}, {ry:4.1f}) m  |  Goal Dist: {d_goal:4.1f}m",
             f"Nearest Obstacle: {min_obs:4.2f}m",
             f"Costmap Overlay: {costmap_mode}",
+            f"Mode: {maneuver_mode}  |  Recovery: {recovery_count}",
+            f"Lane violations: {lane_violations}",
         ]
         y_offset = 62
         for line in lines:
@@ -493,7 +557,7 @@ class PygameViz:
             status_label = "HEALTH: COLLISION"
 
         badge_txt = self.font_badge.render(status_label, True, status_color)
-        hud_surf.blit(badge_txt, (14, 146))
+        hud_surf.blit(badge_txt, (14, 194))
 
         self.screen.blit(hud_surf, (16, 16))
 

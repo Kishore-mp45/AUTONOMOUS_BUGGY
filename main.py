@@ -7,29 +7,21 @@ Usage:
     python main.py                     # run all core combos, headless
     python main.py --viz               # run with live pygame visualisation
     python main.py --runs 3            # override RUNS_PER_COMBO (quick test)
-    python main.py --ctrl RPP          # only run one controller
+    python main.py --ctrl MPPI         # explicit sole controller
     python main.py --scenario s1       # only run matching scenarios
+    python main.py --scenarios s1 s3   # run multiple matching scenarios
     python main.py --headless          # explicit headless
     python main.py --edge-cases        # run edge case scenarios alongside core scenarios
     python main.py --edge-only         # run ONLY edge case scenarios
     python main.py --report            # automatically run report generator after simulation
     python main.py --no-plots          # skip post-run plot generation
 
-Loop structure (as per implementation plan Phase G):
+Loop structure:
     validate()
     for scenario in SCENARIOS:
-        for controller in CONTROLLERS:
-            for run_id in range(RUNS_PER_COMBO):
-                seed = BASE_SEED + run_id
-                scenario.reset(seed=seed)
-                controller.reset()
-                monitor.reset()
-                costmap = scenario.build_costmap()
-                ...
-                control = controller.compute_control(state, path, goal, costmap, obstacles)
-                status, msg = monitor.check(state, control, costmap)
-                ...
-                recorder.save_timestep_csv()
+        for run_id in range(RUNS_PER_COMBO):
+            reset MPPI, maneuver state machine, monitor, model, and scenario
+            run one MPPI episode and record its metrics
 """
 
 import os
@@ -54,9 +46,8 @@ config.validate()
 from robot.bicycle_model import BicycleModel
 
 # ── Controllers ─────────────────────────────────────────────────────────
-from controllers.rpp  import RegulatedPurePursuit
-from controllers.dwa  import DWA
 from controllers.mppi import MPPI
+from maneuvers.maneuver_state_machine import ManeuverStateMachine
 
 # ── Health Monitor ──────────────────────────────────────────────────────
 from health.monitor import HealthMonitor
@@ -71,10 +62,14 @@ from scenarios.s5_sudden_obstacle import S5SuddenObstacle
 # ── Edge Case Scenarios ─────────────────────────────────────────────────
 from scenarios.edge_cases import (
     EC1DeadEnd,
-    EC2OscillationTrigger,
     EC3TightTurn,
     EC4LateBraking,
     EC5Crowd,
+    EC6WrongLaneEntry,
+    EC7UTurnBlocked,
+    EC8MissingLaneMark,
+    EC9SensorNoise,
+    EC10AllSamplesCollide,
 )
 
 # ── Metrics ─────────────────────────────────────────────────────────────
@@ -98,15 +93,6 @@ os.makedirs(_EDGE_DIR,  exist_ok=True)
 # Controller & Scenario registries
 # ═══════════════════════════════════════════════════════════════════════════
 
-def build_controllers() -> dict:
-    """Instantiate all three controllers from config defaults."""
-    return {
-        "RPP":  RegulatedPurePursuit(),
-        "DWA":  DWA(),
-        "MPPI": MPPI(),
-    }
-
-
 def build_core_scenarios() -> dict:
     """Instantiate the 5 core benchmark scenarios."""
     return {
@@ -122,11 +108,26 @@ def build_edge_scenarios() -> dict:
     """Instantiate the 5 edge case scenarios."""
     return {
         "ec1_dead_end":         EC1DeadEnd(),
-        "ec2_oscillation":      EC2OscillationTrigger(),
         "ec3_tight_turn":       EC3TightTurn(),
         "ec4_late_braking":     EC4LateBraking(),
         "ec5_crowd":            EC5Crowd(),
+        "ec6_wrong_lane_entry": EC6WrongLaneEntry(),
+        "ec7_u_turn_blocked":   EC7UTurnBlocked(),
+        "ec8_missing_lane_mark": EC8MissingLaneMark(),
+        "ec9_sensor_noise":     EC9SensorNoise(),
+        "ec10_all_samples_collide": EC10AllSamplesCollide(),
     }
+
+
+def select_scenarios(scenarios: dict, requests: list) -> dict:
+    """Select scenarios whose keys exactly match or contain a requested name."""
+    selected_keys = set()
+    for request in requests:
+        matches = [key for key in scenarios if request.lower() in key.lower()]
+        if not matches:
+            raise ValueError(f"No scenario matches '{request}'.")
+        selected_keys.update(matches)
+    return {key: scenario for key, scenario in scenarios.items() if key in selected_keys}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -146,10 +147,24 @@ def run_simulation(
     run_id:    int = 0,
 ) -> MetricsRecorder:
     """
-    Execute one episode: one controller on one scenario, full metrics recording.
+    Execute one MPPI episode with lane, maneuver, and health monitoring.
     """
     state     = scenario.get_start_state().copy()
     max_steps = int(scenario.time_limit / config.DT)
+    goal = tuple(scenario.goal)
+    recorder.goal_adjusted = False
+    if costmap is not None and costmap.query(*goal) >= config.INSCRIBED_COST:
+        projected_goal = costmap.project_goal_to_free(*goal)
+        if costmap.query(*projected_goal) >= config.INSCRIBED_COST:
+            recorder.finish(success=False, t=0.0, reason="goal_unreachable")
+            recorder.save_timestep_csv(_RAW_DIR)
+            return recorder
+        goal = projected_goal
+        recorder.goal_adjusted = True
+
+    maneuver  = ManeuverStateMachine(controller)
+    maneuver.reset()
+    controller.lane_guidance_enabled = not scenario.disable_lane_cost
 
     # Store scenario metadata on recorder if available
     if hasattr(scenario, "gap_width"):
@@ -159,6 +174,10 @@ def run_simulation(
         t = step_i * config.DT
 
         # ── 1. Update scenario dynamics (moving obstacles / spawn) ──
+        previously_active = {
+            id(obstacle) for obstacle in scenario.get_obstacles()
+            if obstacle.active
+        }
         if hasattr(scenario, "_spawned") or isinstance(scenario, S5SuddenObstacle):
             scenario.update(t, robot_state=state)
             if hasattr(scenario, "spawn_timestep") and scenario.spawn_timestep is not None:
@@ -166,68 +185,117 @@ def run_simulation(
         else:
             scenario.update(t)
 
+        recorder.spawn_adjustment_count += len(
+            scenario.clear_spawn_overlaps(state, previously_active)
+        )
         obstacles = scenario.get_obstacles()
         # Re-stamp the costmap with current obstacle positions. On the S5 spawn
         # frame scenario.update() already did this once; the extra call here
         # guarantees the inflation layer is current for all other scenarios too.
         costmap.update(obstacles)
 
-        # ── 2. Unified controller execution ────────────────────────
-        path = scenario.get_path()
-        goal = scenario.goal
+        # ── 2. State estimation and maneuver update ────────────────
+        controller_state = state.copy()
+        if scenario.sensor_noise is not None:
+            position_std, heading_std = scenario.sensor_noise
+            controller_state[:2] += np.random.normal(0.0, position_std, size=2)
+            controller_state[2] += np.random.normal(0.0, heading_std)
 
-        try:
-            steer, v_cmd = controller.compute_control(
-                state=state,
-                path=path,
-                goal=goal,
-                costmap=costmap,
-                obstacles=obstacles,
-            )
-        except TypeError:
-            # Fallback for any legacy signature if present
-            steer, v_cmd = _legacy_compute_control(controller, state, goal, path, obstacles)
-        except Exception as exc:
-            print(f"    [WARN] Controller error at t={t:.2f}s: {exc}")
-            steer, v_cmd = 0.0, 0.0
+        path = scenario.get_path()
+        scenario_command = scenario.get_maneuver_command(t, state)
+        previous_maneuver_state = maneuver.state
+        maneuver.update(controller_state, path, costmap, scenario_command, t)
+        if previous_maneuver_state == "IN_UTURN" and maneuver.state == "RETURN_LEFT":
+            recorder.record_maneuver_result("u_turn", True)
+        elif previous_maneuver_state == "IN_LEFT" and maneuver.state == "NORMAL":
+            recorder.record_maneuver_result("left_turn", True)
+        elif previous_maneuver_state == "IN_RIGHT" and maneuver.state == "RETURN_LEFT":
+            recorder.record_maneuver_result("right_turn", True)
+        if maneuver._last_completed_maneuver is not None:
+            recorder.record_maneuver_result(maneuver._last_completed_maneuver, True)
+        if maneuver.failure_reason:
+            recorder.record_maneuver_result(maneuver.failed_maneuver, False)
+            recorder.finish(success=False, t=t, reason=maneuver.failure_reason)
+            break
+
+        # ── 3. MPPI controller execution ───────────────────────────
+        steer, v_cmd = controller.compute_control(
+            state=controller_state,
+            path=path,
+            goal=goal,
+            costmap=costmap,
+            obstacles=obstacles,
+        )
 
         control = (steer, v_cmd)
+        recorder.record_recovery_count_total(controller._recovery_count_total)
+        if controller.emergency_stop:
+            failure_reason = (
+                "dead_end" if scenario.name == "ec1_dead_end"
+                else "all_samples_collide"
+            )
+            recorder.finish(success=False, t=t, reason=failure_reason)
+            break
 
-        # ── 3. Health check ─────────────────────────────────────────
+        # ── 4. Health checks ───────────────────────────────────────
+        lane_status, lane_msg = monitor.check_lane_discipline(
+            state, controller.maneuver_mode, controller.lane_map
+        )
+        boundary_status, boundary_msg = monitor.check_boundary(state)
         status, msg = monitor.check(state, control, costmap)
+        recovery_status, recovery_msg = monitor.check_mppi_recovery(
+            controller._recovery_count
+        )
+        if boundary_status == "boundary_exit":
+            recorder.finish(success=False, t=t, reason="boundary_exit")
+            break
         if status == "collision":
-            recorder.finish(success=False, t=t, reason="collision")
+            reason = (
+                "dead_end"
+                if scenario.name == "ec1_dead_end" and controller._recovery_count_total > 0
+                else "collision"
+            )
+            recorder.finish(success=False, t=t, reason=reason)
             break
         elif status == "stuck":
             recorder.finish(success=False, t=t, reason="stuck")
             break
-        elif status == "oscillating":
-            recorder.oscillations += 1
 
-        # ── 4. Record this timestep ─────────────────────────────────
+        # ── 5. Record this timestep ─────────────────────────────────
         recorder.step(
             state=state,
             obstacles=obstacles,
             t=t,
             control=control,
             costmap=costmap,
+            lane_map=getattr(controller, "lane_map", None),
+            maneuver_mode=getattr(controller, "maneuver_mode", "normal"),
+            mppi_recovery_count=getattr(controller, "_recovery_count_total", 0),
+            reference_path=path,
+            lane_guidance_enabled=controller.lane_guidance_enabled,
+            narrow_gap_violation=(
+                recorder.gap_width is not None and lane_status == "lane_violation"
+            ),
+            weight_fallback_count=controller.weight_fallback_count,
+            ackermann_clamp_count=controller.ackermann_clamp_count,
+            estimated_state=controller_state,
         )
 
-        # ── 5. Check termination conditions ─────────────────────────
+        # ── 6. Check termination conditions ─────────────────────────
         if recorder.failed:
             recorder.finish(success=False, t=t)
             break
 
-        done, success, reason = scenario.is_complete(state, t)
+        done, success, reason = scenario.is_complete(state, t, goal=goal)
         if done:
             recorder.finish(success=success, t=t, reason=reason)
             break
 
-        # ── 6. Convert v_cmd -> acceleration and step robot ─────────
+        # ── 7. Convert v_cmd -> acceleration and step robot ────────
         a = _v_cmd_to_accel(v_cmd, float(state[3]))
         state = model.update(state, np.array([steer, a]))
 
-        # ── 7. Live visualisation (optional) ───────────────────────
+        # ── 8. Live visualisation (optional) ───────────────────────
         if viz is not None:
             is_spawn_step = (
                 hasattr(scenario, "spawn_timestep") and
@@ -245,9 +313,20 @@ def run_simulation(
                 t=t,
                 costmap=costmap,
                 controller=controller,
-                health_status=status,
-                health_msg=msg,
+                health_status=(
+                    boundary_status if boundary_status != "ok" else
+                    recovery_status if recovery_status != "ok" else
+                    lane_status if lane_status != "ok" else status
+                ),
+                health_msg=(
+                    boundary_msg if boundary_msg else
+                    recovery_msg if recovery_msg else
+                    lane_msg if lane_msg else msg
+                ),
                 spawn_event=is_spawn_step,
+                maneuver_mode=controller.maneuver_mode,
+                recovery_count=controller._recovery_count,
+                lane_violations=monitor.lane_violation_count,
             )
             if not keep_running:
                 raise KeyboardInterrupt("Pygame window closed.")
@@ -262,23 +341,21 @@ def run_simulation(
     if not recorder.completed and not recorder.failed:
         recorder.finish(success=False, t=max_steps * config.DT)
 
+    active_maneuvers = {
+        "IN_LEFT": "left_turn",
+        "PRE_RIGHT": "right_turn",
+        "IN_RIGHT": "right_turn",
+        "OVERTAKING": "overtake",
+        "IN_UTURN": "u_turn",
+    }
+    unfinished_maneuver = active_maneuvers.get(maneuver.state)
+    if unfinished_maneuver and unfinished_maneuver not in recorder.maneuver_success:
+        recorder.record_maneuver_result(unfinished_maneuver, False)
+
     # Save structured per-step CSV
     recorder.save_timestep_csv(_RAW_DIR)
 
     return recorder
-
-
-def _legacy_compute_control(controller, state, goal, path, obstacles):
-    if isinstance(controller, RegulatedPurePursuit):
-        return controller.compute_control(state, path, obstacles)
-    elif isinstance(controller, DWA):
-        return controller.compute_control(state, goal, obstacles)
-    elif isinstance(controller, MPPI):
-        delta, a = controller.compute_control(state, path, obstacles)
-        v_next   = float(np.clip(state[3] + a * config.DT, 0.0, config.MAX_SPEED))
-        return delta, v_next
-    raise TypeError(f"Unknown controller type: {type(controller)}")
-
 
 def _v_cmd_to_accel(v_cmd: float, v_curr: float) -> float:
     """Convert a speed setpoint to an acceleration command, clipped to limits."""
@@ -340,35 +417,42 @@ def _progress_bar(done: int, total: int, width: int = 28) -> str:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Campus Buggy — Local Planner Comparison Experiment"
+        description="Campus Buggy — MPPI Autonomous Navigation Experiment"
     )
     parser.add_argument("--viz",        action="store_true",
                         help="Enable live pygame visualisation")
     parser.add_argument("--headless",   action="store_true",
                         help="Force headless mode (no pygame)")
     parser.add_argument("--runs",       type=int, default=config.RUNS_PER_COMBO,
-                        help=f"Runs per controller x scenario combo (default: {config.RUNS_PER_COMBO})")
+                        help=f"Runs per scenario (default: {config.RUNS_PER_COMBO})")
     parser.add_argument("--ctrl",       type=str, default=None,
-                        help="Only run this controller: RPP | DWA | MPPI")
+                        help="Only run this controller: MPPI")
     parser.add_argument("--scenario",   type=str, default=None,
-                        help="Only run scenarios whose name contains this substring")
+                        help="Only run scenarios whose name contains this substring (legacy filter)")
+    parser.add_argument("--scenarios",  nargs="+", default=None,
+                        help="Run scenarios matching any of these names (e.g. s1 s3 s5)")
     parser.add_argument("--edge-cases", action="store_true",
-                        help="Include the 5 edge case scenarios in the simulation runs")
+                        help="Include the edge case scenarios in the simulation runs")
     parser.add_argument("--edge-only",  action="store_true",
-                        help="Run ONLY the 5 edge case scenarios")
+                        help="Run ONLY the edge case scenarios")
     parser.add_argument("--report",     action="store_true",
                         help="Generate 8-plot comparison report after runs")
     parser.add_argument("--no-plots",   action="store_true",
                         help="Skip post-run matplotlib plot generation")
+    parser.add_argument("--vis-mppi-samples", action="store_true",
+                        help="Show MPPI sampled trajectories in pygame visualization")
     args = parser.parse_args()
 
     use_viz = args.viz and not args.headless and not config.HEADLESS
     runs    = args.runs
+    if runs < 1:
+        parser.error("--runs must be at least 1")
 
-    # ── Instantiate controllers & models ───────────────────────────
+    # ── Instantiate sole controller & models ───────────────────────
     model       = BicycleModel()
     monitor     = HealthMonitor()
-    controllers = build_controllers()
+    controller  = MPPI()
+    ctrl_name   = controller.name
 
     # Determine which scenarios to run
     if args.edge_only:
@@ -381,30 +465,35 @@ def main():
         scenarios = build_core_scenarios()
         is_edge_experiment = False
 
-    # Filters
-    if args.ctrl:
-        key = args.ctrl.upper()
-        if key not in controllers:
-            print(f"[ERROR] Unknown controller '{key}'. Choose from: {list(controllers)}")
-            sys.exit(1)
-        controllers = {key: controllers[key]}
+    if args.ctrl and args.ctrl.upper() != "MPPI":
+        parser.error(f"Only MPPI is supported; received controller '{args.ctrl}'.")
 
+    # Select specific scenarios, supporting short names such as "s1" and "ec7".
+    if args.scenarios:
+        try:
+            scenarios = select_scenarios(scenarios, args.scenarios)
+        except ValueError as exc:
+            parser.error(str(exc))
     if args.scenario:
         scenarios = {k: v for k, v in scenarios.items() if args.scenario in k}
         if not scenarios:
             print(f"[ERROR] No scenario matching '{args.scenario}'.")
             sys.exit(1)
 
-    total_runs = len(scenarios) * len(controllers) * runs
+    edge_names = set(build_edge_scenarios())
+    is_edge_experiment = bool(scenarios) and set(scenarios).issubset(edge_names)
+    total_runs = len(scenarios) * runs
 
     print(f"\n{'='*62}")
-    print(f"  Campus Buggy  --  Local Planner Comparison")
+    print(f"  Campus Buggy  --  MPPI Autonomous Navigation")
     print(f"{'='*62}")
-    print(f"  Controllers : {list(controllers.keys())}")
+    print(f"  Controller  : {ctrl_name}")
     print(f"  Scenarios   : {list(scenarios.keys())}")
     print(f"  Runs each   : {runs}")
     print(f"  Total runs  : {total_runs}")
     print(f"  Visualise   : {'YES (pygame)' if use_viz else 'NO (headless)'}")
+    if args.vis_mppi_samples and not use_viz:
+        print("  Note        : --vis-mppi-samples requires --viz; sample drawing is disabled.")
     print(f"{'='*62}\n")
 
     # ── Optional pygame init ───────────────────────────────────────
@@ -413,6 +502,7 @@ def main():
         try:
             from visualization.pygame_viz import PygameViz
             viz = PygameViz()
+            viz.show_mppi_samples = args.vis_mppi_samples
         except Exception as e:
             print(f"[WARN] Pygame unavailable: {e}\n       Running headless.")
             viz = None
@@ -424,78 +514,62 @@ def main():
 
     try:
         for scenario_name, scenario in scenarios.items():
-            for ctrl_name, controller in controllers.items():
+            outcomes = []
 
-                outcomes = []
+            for run_id in range(runs):
+                run_count += 1
 
-                for run_id in range(runs):
-                    run_count += 1
+                seed = config.BASE_SEED + run_id
+                scenario.reset(seed=seed)
+                controller.reset()
+                monitor.reset()
+                model.reset()
+                costmap = scenario.costmap
+                if costmap is None:
+                    costmap = scenario.build_costmap()
+                    scenario.costmap = costmap
+                costmap.add_lane_boundaries()
 
-                    # Seed-based reproducibility (Phase G specification)
-                    seed = config.BASE_SEED + run_id
-                    scenario.reset(seed=seed)
-                    controller.reset()
-                    monitor.reset()
-                    model.reset()
-                    # Use the scenario's own costmap so that scenario.update()
-                    # and the controller always see the same Costmap2D object.
-                    costmap = scenario.costmap
-                    if costmap is None:
-                        costmap = scenario.build_costmap()
-                        scenario.costmap = costmap
+                recorder = MetricsRecorder(ctrl_name, scenario_name, run_id)
+                t_run_wall = time.time()
 
-                    recorder = MetricsRecorder(ctrl_name, scenario_name, run_id)
+                run_simulation(
+                    scenario=scenario,
+                    controller=controller,
+                    recorder=recorder,
+                    model=model,
+                    monitor=monitor,
+                    costmap=costmap,
+                    viz=viz,
+                    ctrl_name=ctrl_name,
+                    scenario_name=scenario_name,
+                    run_id=run_id,
+                )
 
-                    t_run_wall = time.time()
+                elapsed_wall = time.time() - t_run_wall
+                all_results.append(recorder.to_dict())
 
-                    run_simulation(
-                        scenario=scenario,
-                        controller=controller,
-                        recorder=recorder,
-                        model=model,
-                        monitor=monitor,
-                        costmap=costmap,
-                        viz=viz,
-                        ctrl_name=ctrl_name,
-                        scenario_name=scenario_name,
-                        run_id=run_id,
-                    )
+                raw_csv = os.path.join(
+                    _RAW_DIR,
+                    f"{ctrl_name}__{scenario_name}__run{run_id:02d}.csv"
+                )
+                recorder.save_csv(raw_csv)
 
-                    elapsed_wall = time.time() - t_run_wall
+                tag = "OK" if recorder.completed else (recorder.failure_reason or "?")[:4].upper()
+                outcomes.append(tag)
 
-                    # Store
-                    result = recorder.to_dict()
-                    all_results.append(result)
+                bar = _progress_bar(run_count, total_runs)
+                print(
+                    f"  {bar}  "
+                    f"{ctrl_name:<4}|{scenario_name:<24}|"
+                    f"run {run_id+1:2d}/{runs}  "
+                    f"[{tag:<4}]  "
+                    f"wall {elapsed_wall:.1f}s"
+                )
 
-                    # Save per-run legacy time-series CSV as well
-                    raw_csv = os.path.join(
-                        _RAW_DIR,
-                        f"{ctrl_name}__{scenario_name}__run{run_id:02d}.csv"
-                    )
-                    recorder.save_csv(raw_csv)
-
-                    # Outcome label
-                    if recorder.completed:
-                        tag = "OK"
-                    else:
-                        r = recorder.failure_reason or "?"
-                        tag = r[:4].upper()
-                    outcomes.append(tag)
-
-                    # Print progress
-                    bar = _progress_bar(run_count, total_runs)
-                    print(
-                        f"  {bar}  "
-                        f"{ctrl_name:<4}|{scenario_name:<24}|"
-                        f"run {run_id+1:2d}/{runs}  "
-                        f"[{tag:<4}]  "
-                        f"wall {elapsed_wall:.1f}s"
-                    )
-
-                # Per-combo summary line
-                ok = outcomes.count("OK")
-                print(f"    --> {ctrl_name}/{scenario_name}: "
-                      f"{ok}/{runs} OK  {outcomes}\n")
+            ok = outcomes.count("OK")
+            print(f"    --> {ctrl_name}/{scenario_name}: "
+                  f"{ok}/{runs} OK  {outcomes}\n")
 
     except KeyboardInterrupt:
         print("\n[INTERRUPTED] Saving partial results...")
@@ -552,4 +626,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
